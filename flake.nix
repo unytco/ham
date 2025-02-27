@@ -27,6 +27,10 @@
           yarn # For UI development
           # Add any other packages you need here
           # wasm-strip # For stripping WASM files
+          # Add OpenSSL and its development packages
+          openssl
+          pkg-config
+          openssl.dev
         ]);
 
         shellHook = ''

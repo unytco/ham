@@ -1,0 +1,18 @@
+[package]
+name = "hc_connect"
+version = "0.1.0"
+edition = "2021"
+authors = ["zo-el <joelulahanna@gmaail.com>"]
+
+[dependencies]
+anyhow = "1.0"
+holochain_types = { workspace = true }
+holochain_conductor_api = { workspace = true }
+holochain_websocket = { workspace = true }
+holochain_keystore = { workspace = true }
+serde = { workspace = true }
+tracing = "0.1"
+getrandom = "0.3.1"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] } 
