@@ -10,9 +10,9 @@ struct Cli {
     #[arg(short, long, default_value = "4444")]
     port: u16,
 
-    /// Path to the .happ file to install
+    /// Path or URL to the .happ file to install
     #[arg(short, long)]
-    happ: PathBuf,
+    happ: String,
 
     /// Optional network seed for the app
     #[arg(short, long)]
