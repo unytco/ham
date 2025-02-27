@@ -1,6 +1,5 @@
 use crate::taskgroup_manager::kill_on_drop::{kill_on_drop, KillChildOnDrop};
 use lair_keystore_api::prelude::LairServerConfigInner as LairConfig;
-use serde::Serialize;
 use snafu::Snafu;
 use std::{
     fs::File,
@@ -9,10 +8,11 @@ use std::{
     process::{Command, Stdio},
 };
 use tempfile::TempDir;
-use tracing::trace;
+use tracing::{info, trace};
+use url2::Url2;
 
 pub fn default_password() -> String {
-    std::env::var("HOLOCHAIN_DEFAULT_PASSWORD").unwrap()
+    std::env::var("HOLOCHAIN_DEFAULT_PASSWORD").unwrap_or_else(|_| "super-secret".to_string())
 }
 
 pub fn spawn_holochain(
@@ -81,62 +81,38 @@ fn write_holochain_config(
     path: &Path,
     lair_connection_url: String,
     admin_port: u16,
-) -> Result<(), WriteHolochainConfigError> {
-    let mut holochain_config_file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .unwrap();
+) -> anyhow::Result<()> {
+    use holochain_conductor_api::{
+        conductor::paths::DataRootPath, conductor::ConductorConfig,
+        config::conductor::KeystoreConfig, config::AdminInterfaceConfig,
+    };
 
-    #[derive(Serialize)]
-    struct HolochainConfig {
-        data_root_path: PathBuf,
-        keystore: KeystoreConfig,
-        dpki: DpkiConfig,
-        admin_interfaces: Option<Vec<AdminInterfaceConfig>>,
-    }
-    #[derive(Serialize)]
-    pub struct DpkiConfig {
-        pub dna_path: Option<PathBuf>,
-        pub device_seed_lair_tag: String,
-        pub no_dpki: bool,
-    }
-    #[derive(Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    enum KeystoreConfig {
-        LairServer { connection_url: String },
-    }
-
-    #[derive(Serialize)]
-    struct AdminInterfaceConfig {
-        driver: AdminInterfaceDriver,
-    }
-
-    #[derive(Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    enum AdminInterfaceDriver {
-        Websocket { port: u16, allowed_origins: String },
-    }
-
-    let config = HolochainConfig {
-        data_root_path: "./databases".into(),
+    let config = ConductorConfig {
+        data_root_path: Some(DataRootPath::from(path.parent().unwrap().join("data"))),
         keystore: KeystoreConfig::LairServer {
-            connection_url: lair_connection_url,
-        },
-        // Holo does not use DPKI, when we start using it this should be updated
-        dpki: DpkiConfig {
-            dna_path: None,
-            device_seed_lair_tag: "dont-use-dpki".to_string(),
-            no_dpki: true,
+            connection_url: Url2::parse(&lair_connection_url),
         },
         admin_interfaces: Some(vec![AdminInterfaceConfig {
-            driver: AdminInterfaceDriver::Websocket {
+            driver: holochain_conductor_api::config::InterfaceDriver::Websocket {
                 port: admin_port,
-                allowed_origins: "*".to_string(),
+                allowed_origins: holochain_types::websocket::AllowedOrigins::Any,
             },
         }]),
+        network: Default::default(),
+        db_sync_strategy: Default::default(),
+        tracing_override: None,
+        device_seed_lair_tag: Some("holochain-device-seed".to_string()),
+        danger_generate_throwaway_device_seed: false,
+        dpki: Default::default(),
+        tuning_params: Default::default(),
     };
-    serde_yaml::to_writer(&mut holochain_config_file, &config).unwrap();
 
+    std::fs::write(
+        path,
+        serde_yaml::to_string(&config).expect("Failed to serialize config"),
+    )
+    .expect("Failed to write config file");
+
+    info!("Wrote conductor config to {:?}", path);
     Ok(())
 }

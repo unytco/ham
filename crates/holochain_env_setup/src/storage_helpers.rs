@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::{fs, io::prelude::*};
 use tempfile::TempDir;
 use tracing::debug;
-use url::Url;
+use url2::Url2;
 
-pub async fn download_file(url: &Url) -> Result<PathBuf> {
+pub async fn download_file(url: &Url2) -> Result<PathBuf> {
     use isahc::config::RedirectPolicy;
     use isahc::prelude::*;
     use isahc::HttpClient;
@@ -18,7 +18,7 @@ pub async fn download_file(url: &Url) -> Result<PathBuf> {
         p
     } else {
         debug!("downloading");
-        let mut url = Url::clone(url);
+        let mut url = url.clone();
         url.set_scheme("https")
             .map_err(|_| anyhow!("failed to set scheme to https"))?;
         let client = HttpClient::builder()

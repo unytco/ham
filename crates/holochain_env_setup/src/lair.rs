@@ -1,3 +1,7 @@
+use crate::{
+    holochain::default_password,
+    taskgroup_manager::kill_on_drop::{kill_on_drop, KillChildOnDrop},
+};
 use holochain_keystore::MetaLairClient;
 use lair_keystore_api::prelude::{
     LairServerConfigInner as LairConfig, LairServerSignatureFallback,
@@ -10,7 +14,6 @@ use std::{
     process::{self, Command},
     str,
 };
-use crate::taskgroup_manager::kill_on_drop::{kill_on_drop, KillChildOnDrop};
 
 pub async fn spawn(
     tmp_dir: &Path,
@@ -66,8 +69,7 @@ pub async fn spawn(
 
     let connection_url = lair_config.connection_url.clone();
 
-    let env_pw = std::env::var("HOLOCHAIN_DEFAULT_PASSWORD")
-        .expect("HOLOCHAIN_DEFAULT_PASSWORD must be set");
+    let env_pw = default_password();
     let passphrase: sodoken::BufRead = sodoken::BufRead::from(env_pw.to_string().as_bytes());
 
     let keystore = match holochain_keystore::lair_keystore::spawn_lair_keystore(
@@ -131,8 +133,9 @@ fn import_seed(lair_dir: &Path, log: File, device_bundle: &str) -> Result<(), In
             .unwrap(),
     );
     // Here format of a passphrase is "<lair_password>/n<seed_bundle_password>"
-    let holochain_password = std::env::var("HOLOCHAIN_DEFAULT_PASSWORD").unwrap();
-    let device_password = std::env::var("DEVICE_SEED_DEFAULT_PASSWORD").unwrap();
+    let holochain_password = default_password();
+    let device_password = std::env::var("DEVICE_SEED_DEFAULT_PASSWORD")
+        .expect("DEVICE_SEED_DEFAULT_PASSWORD must be set");
     let pass = format!("{}\n{}", holochain_password, device_password);
     write_passphrase(&mut lair_init, Some(pass.as_bytes())).unwrap();
     let exit_status = lair_init.wait().unwrap();
@@ -153,8 +156,7 @@ fn write_passphrase(child: &mut KillChildOnDrop, buf: Option<&[u8]>) -> Result<(
             .expect("child lair process was spawned with piped stdin")
             .write_all(pas)
     } else {
-        let env_pw = std::env::var("HOLOCHAIN_DEFAULT_PASSWORD")
-            .expect("HOLOCHAIN_DEFAULT_PASSWORD must be set");
+        let env_pw = default_password();
         child
             .stdin
             .take()

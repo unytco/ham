@@ -1,12 +1,30 @@
-use crate::holochain::spawn_holochain;
-
 use super::lair;
+use crate::holochain::spawn_holochain;
+use crate::taskgroup_manager::kill_on_drop::KillChildOnDrop;
+use anyhow::Context;
 use holochain_keystore::MetaLairClient;
 use lair_keystore_api::prelude::LairServerConfigInner as LairConfig;
-use log::trace;
 use snafu::Snafu;
 use std::path::{Path, PathBuf};
-use crate::taskgroup_manager::kill_on_drop::KillChildOnDrop;
+use std::{fs, time::Duration};
+use tokio::time::sleep;
+use tracing::info;
+
+async fn wait_for_conductor(log_path: &Path) -> anyhow::Result<()> {
+    for i in 1..=30 {
+        if let Ok(logs) = fs::read_to_string(log_path) {
+            if logs.contains("Conductor successfully initialized") {
+                info!("Conductor initialization confirmed");
+                return Ok(());
+            }
+        }
+        info!("Waiting for conductor initialization... (attempt {})", i);
+        sleep(Duration::from_secs(1)).await;
+    }
+    Err(anyhow::anyhow!(
+        "Conductor failed to initialize after 30 seconds"
+    ))
+}
 
 pub async fn setup_environment(
     tmp_dir: &Path,
@@ -14,13 +32,18 @@ pub async fn setup_environment(
     device_bundle: Option<&str>,
     lair_fallback: Option<(PathBuf, u16)>,
 ) -> Result<Environment, SetupEnvironmentError> {
-    trace!("Starting lair-keystore");
+    info!("Starting lair-keystore");
     let (lair, lair_config, keystore) = lair::spawn(tmp_dir, log_dir, device_bundle, lair_fallback)
         .await
         .unwrap();
 
-    trace!("Spinning up holochain");
+    info!("Starting Holochain conductor");
     let holochain = spawn_holochain(tmp_dir, log_dir, lair_config.clone());
+
+    // Wait for conductor to be ready
+    wait_for_conductor(&log_dir.join("holochain.txt"))
+        .await
+        .context("Failed waiting for conductor")?;
 
     Ok(Environment {
         _holochain: holochain,
