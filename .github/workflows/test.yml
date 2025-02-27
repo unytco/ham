@@ -22,5 +22,5 @@ jobs:
       - name: Run tests in Nix shell
         run: |
           nix develop --command bash -c '
-            cargo test --all
+            RUST_LOG=info cargo test --all
           '

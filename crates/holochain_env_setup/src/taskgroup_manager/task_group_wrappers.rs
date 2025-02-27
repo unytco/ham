@@ -83,7 +83,7 @@ pub mod propagate_panics {
         /// Example
         /// ```
         /// # use std::{any::Any, panic::catch_unwind};
-        /// # use crate::taskgroup_manager::task_group_wrappers::propagate_panics::PanicPayload;
+        /// # use holochain_env_setup::taskgroup_manager::task_group_wrappers::propagate_panics::PanicPayload;
         /// let result: Result<(), Box<dyn Any + Send>> = catch_unwind(|| panic!("fatal: {}", "problem"));
         /// let panic_payload = PanicPayload(result.unwrap_err());
         /// // assert_eq!(panic_payload.as_formatted_panic(), Some("fatal: problem"));
@@ -97,7 +97,7 @@ pub mod propagate_panics {
         /// Example
         /// ```
         /// # use std::{any::Any, panic::catch_unwind};
-        /// # use crate::taskgroup_manager::task_group_wrappers::propagate_panics::PanicPayload;
+        /// # use holochain_env_setup::taskgroup_manager::task_group_wrappers::propagate_panics::PanicPayload;
         /// let result: Result<(), Box<dyn Any + Send>> = catch_unwind(|| panic!("static panic message"));
         /// let panic_payload = PanicPayload(result.unwrap_err());
         /// // assert_eq!(panic_payload.as_literal_panic(), Some("static panic message"));
