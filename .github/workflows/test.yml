@@ -13,11 +13,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+      - name: Install nix
+        uses: cachix/install-nix-action@v27
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.23.2/install
 
-      - name: Cache Nix store
-        uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: cachix/cachix-action@v15
+        with:
+          name: holochain-ci
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            # Cache Holochain and Lair data directories
+            ~/.cache/holochain
+            ~/.local/share/holochain
+          key: ${{ runner.os }}-cargo-holochain-${{ hashFiles('**/Cargo.lock', 'flake.nix', 'flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-holochain-
+            ${{ runner.os }}-cargo-
 
       - name: Run tests in Nix shell
         run: |
