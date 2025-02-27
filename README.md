@@ -32,8 +32,12 @@ ham --happ path/to/your/app.happ
 ham --happ https://example.com/path/to/app.happ
 ```
 
-All available options:
+Install with network seed:
 
+```bash
+ham --happ path/to/your/app.happ --network-seed 1234567890
 ```
 
+```bash
+ham --happ https://example.com/path/to/app.happ --network-seed 1234567890
 ```
