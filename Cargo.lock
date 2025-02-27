@@ -1240,6 +1240,7 @@ name = "ham"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap 4.5.31",
  "holochain_client",
  "holochain_conductor_api",
  "holochain_env_setup",

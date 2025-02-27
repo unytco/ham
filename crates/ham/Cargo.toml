@@ -11,6 +11,8 @@ holochain_types = { workspace = true }
 holochain_client = { workspace = true }
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
+clap = { version = "4.4", features = ["derive"] }
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 holochain_env_setup = { path = "../holochain_env_setup" }
