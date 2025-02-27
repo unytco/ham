@@ -34,14 +34,13 @@ All available options:
 
 ```bash
 ham --port 4444 --happ path/to/your/app.happ --network-seed "optional-network-seed"
-```
 
-```
 Options:
 
 - `-p, --port <PORT>`: The admin port of your Holochain conductor (default: 4444)
 - `-h, --happ <PATH>`: Path to the .happ file you want to install (required)
 - `-n, --network-seed <SEED>`: Optional network seed for the app
+
 ```
 
 ## Development
@@ -72,7 +71,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ### Testing
 
 The test suite requires running inside the Nix environment to ensure all dependencies (Holochain, Lair) are available. GitHub Actions is configured to run all tests in the correct environment automatically for all PRs and pushes to main.
-
-```
-
-```
