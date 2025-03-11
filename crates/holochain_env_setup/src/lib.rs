@@ -1,8 +1,49 @@
+//! # holochain_env_setup
+//!
+//! Test utilities for setting up Holochain environments with conductor and lair-keystore.
+//!
+//! This crate provides utilities for setting up a complete Holochain environment for testing purposes.
+//!
+//! ## Example
+//!
+//! ```no_run
+//! use holochain_env_setup::environment::setup_environment;
+//! use tempfile::tempdir;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Create temporary directories
+//!     let tmp_dir = tempdir()?.into_path();
+//!     let log_dir = tmp_dir.join("log");
+//!     std::fs::create_dir_all(&log_dir)?;
+//!
+//!     // Setup the environment
+//!     let env = setup_environment(&tmp_dir, &log_dir, None, None).await?;
+//!
+//!     // Use the environment...
+//!     let _agent_key = env.keystore.new_sign_keypair_random().await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Features
+//!
+//! - Temporary environment setup for testing
+//! - Automatic process cleanup
+//! - Configurable ports and settings
+//! - Integration with Lair keystore
+//! - Logging support
+
 pub mod environment;
 pub mod holochain;
 pub mod lair;
 pub mod storage_helpers;
 pub mod taskgroup_manager;
+
+// Re-export commonly used items
+pub use environment::setup_environment;
+pub use environment::Environment;
 
 #[cfg(test)]
 mod tests {

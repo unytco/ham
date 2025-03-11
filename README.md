@@ -41,3 +41,8 @@ ham --happ path/to/your/app.happ --network-seed 1234567890
 ```bash
 ham --happ https://example.com/path/to/app.happ --network-seed 1234567890
 ```
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0).
+See the [LICENSE](LICENSE) file for details.

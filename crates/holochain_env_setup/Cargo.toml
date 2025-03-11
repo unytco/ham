@@ -3,6 +3,13 @@ name = "holochain_env_setup"
 version = "0.1.0"
 authors = ["zo-el <joelulahanna@gmaail.com>"]
 edition = "2021"
+description = "Test utilities for setting up Holochain environments with conductor and lair-keystore"
+license = "GPL-3.0"
+repository = "https://github.com/holochain/ham"
+documentation = "https://docs.rs/holochain_env_setup"
+readme = "README.md"
+keywords = ["holochain", "testing", "environment", "conductor", "lair"]
+categories = ["development-tools::testing", "development-tools::build-utils"]
 
 [dependencies]
 anyhow = "1.0"
