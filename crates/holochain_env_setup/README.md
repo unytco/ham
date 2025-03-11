@@ -11,6 +11,10 @@ This crate provides utilities for setting up a complete Holochain environment fo
 - Configuring and starting a Holochain conductor
 - Managing the lifecycle of these processes
 
+# Bug:
+
+use `RUST_LOG=info` when running the tests to see the logs and it will let the enviorment to setup
+
 ## Usage
 
 ```rust
