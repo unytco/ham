@@ -1,0 +1,15 @@
+[package]
+name = "ham"
+version = "0.1.0"
+edition = "2021"
+description = "Production-grade Holochain AppWebsocket wrapper with reconnect, shutdown, and error-classification helpers"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unytco/ham"
+
+[dependencies]
+anyhow = "1"
+holochain_client = "0.8.1-rc.7"
+rmp-serde = "1.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "signal", "sync", "time", "rt"] }
+tracing = "0.1"
