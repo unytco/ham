@@ -23,9 +23,26 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
     NEEDLES.iter().any(|n| msg.contains(n))
 }
 
+/// Classifies whether an `anyhow::Error` represents server-side *source-chain
+/// pressure* on the Holochain conductor, as opposed to a transport failure.
+///
+/// The canonical example is `"Source chain error: deadline has elapsed"`:
+/// the workflow hit its internal timeout while the websocket was still
+/// healthy. On these errors the remote commit may or may not have landed,
+/// so the caller should back off briefly before retrying rather than
+/// hammering a struggling conductor in a tight loop.
+///
+/// This is intentionally kept distinct from [`is_connection_error`]; the
+/// two classes overlap zero in practice and deserve different handling
+/// (reconnect vs. cooldown).
+pub fn is_source_chain_pressure(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("deadline has elapsed") || msg.contains("Source chain error")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_connection_error;
+    use super::{is_connection_error, is_source_chain_pressure};
     use anyhow::anyhow;
 
     fn wrap(base: &'static str) -> anyhow::Error {
@@ -90,5 +107,38 @@ mod tests {
     fn rejects_unrelated_error() {
         let e = anyhow!("some unrelated problem");
         assert!(!is_connection_error(&e));
+    }
+
+    #[test]
+    fn classifies_deadline_elapsed_as_source_chain_pressure() {
+        // Exact error string from the incident that motivated this classifier.
+        let e = wrap("Source chain error: deadline has elapsed");
+        assert!(is_source_chain_pressure(&e));
+        // And is NOT treated as a socket failure — the socket is fine.
+        assert!(!is_connection_error(&e));
+    }
+
+    #[test]
+    fn classifies_bare_deadline_elapsed() {
+        let e = anyhow!("deadline has elapsed");
+        assert!(is_source_chain_pressure(&e));
+    }
+
+    #[test]
+    fn classifies_bare_source_chain_error() {
+        let e = wrap("Source chain error: some other backpressure mode");
+        assert!(is_source_chain_pressure(&e));
+    }
+
+    #[test]
+    fn rejects_connection_error_as_source_chain_pressure() {
+        let e = wrap("Websocket error: Websocket closed: ConnectionClosed");
+        assert!(!is_source_chain_pressure(&e));
+    }
+
+    #[test]
+    fn rejects_unrelated_error_as_source_chain_pressure() {
+        let e = anyhow!("some unrelated problem");
+        assert!(!is_source_chain_pressure(&e));
     }
 }

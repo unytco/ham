@@ -23,6 +23,6 @@ pub mod reconnect;
 pub mod shutdown;
 
 pub use client::{Ham, HamConfig};
-pub use errors::is_connection_error;
+pub use errors::{is_connection_error, is_source_chain_pressure};
 pub use reconnect::{compute_delay_ms, connect_with_backoff, BackoffConfig};
 pub use shutdown::{install_shutdown_handler, ShutdownRx};
