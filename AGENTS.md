@@ -27,6 +27,15 @@ classifier.
 cargo build --release
 ```
 
+## Format
+
+Apply, then verify:
+
+```bash
+cargo fmt
+cargo fmt --check
+```
+
 ## Test
 
 ```bash
@@ -49,6 +58,21 @@ compatible set of consumer updates has landed.
   [`pricing_oracle`](../pricing_oracle/),
   [`watchtower/crates/observer`](../watchtower/).
 - See workshop [`AGENTS.md`](../AGENTS.md) for the full classification map.
+
+## Changelog
+
+File: [`./CHANGELOG.md`](./CHANGELOG.md). Format: [Keep a Changelog
+1.1.0](https://keepachangelog.com/en/1.1.0/) with `## [Unreleased]` at
+the top and standard subsections (Added/Changed/Deprecated/Removed/
+Fixed/Security). One bullet per agent change, ≤120 chars,
+present-tense imperative. Branch-type → section mapping per workshop
+[`branch-and-pr-workflow.mdc`](../.cursor/rules/branch-and-pr-workflow.mdc)
+(if cloned outside workshop, the same convention still applies).
+
+Because `ham` is a Rust library consumers pin by `rev = "<sha>"`,
+changelog entries should call out **breaking changes** explicitly
+(rename of public API, change to error semantics, dropped trait impls)
+under `### Changed` or `### Removed`.
 
 ## Repo-specific rules
 
