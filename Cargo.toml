@@ -8,7 +8,7 @@ repository = "https://github.com/unytco/ham"
 
 [dependencies]
 anyhow = "1"
-holochain_client = "0.8.1-rc.7"
+holochain_client = "0.8.1"
 rmp-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "signal", "sync", "time", "rt"] }
