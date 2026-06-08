@@ -5,6 +5,9 @@ edition = "2021"
 description = "Production-grade Holochain AppWebsocket wrapper with reconnect, shutdown, and error-classification helpers"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/unytco/ham"
+readme = "README.md"
+keywords = ["holochain", "websocket", "client", "reconnect"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 anyhow = "1"
