@@ -1,18 +1,10 @@
 # ham — Agent Instructions
 
+> **This repo follows the workshop root's patterns — it does not define its own.** Development workflow, process, changelog conventions, and spec/feature-doc discipline live in the workshop: [`CLAUDE.md`](../CLAUDE.md), [`AGENTS.md`](../AGENTS.md), [`documentation/DEVELOPMENT_WORKFLOW.md`](../documentation/DEVELOPMENT_WORKFLOW.md). Below is only what's specific to THIS repo.
+
 ## Purpose
 
-Production `AppWebsocket` client wrapper used by every Rust service in the
-Unyt workshop that talks to a Holochain conductor (`bridge-orchestrator`,
-`unyt_cli` daemon, `pricing_oracle`, `watchtower/observer`). Wraps
-`holochain_client::AppWebsocket` and adds connect-once setup, signing
-credential authorization, typed msgpack zome calls with explicit timeouts,
-shutdown-aware reconnect with backoff/jitter, and a connection-error
-classifier.
-
-## Classification
-
-`library`
+`library` — production `AppWebsocket` client wrapper used by every Rust service in the Unyt workshop that talks to a Holochain conductor. Wraps `holochain_client::AppWebsocket` and adds connect-once setup, signing credential authorization, typed msgpack zome calls with explicit timeouts, shutdown-aware reconnect with backoff/jitter, and a connection-error classifier.
 
 ## Stack
 
@@ -51,31 +43,9 @@ n/a — this is a library. Consumers pin a `rev = "<sha>"` (not a tag) in
 their own `Cargo.toml` so rollouts are reproducible. Tags are cut once a
 compatible set of consumer updates has landed.
 
-## Related repos in workshop
-
-- Consumed by [`raindex-orders/bridge-orchestrator`](../raindex-orders/),
-  [`unyt-sandbox/unyt/.../unyt_cli`](../unyt-sandbox/),
-  [`pricing_oracle`](../pricing_oracle/),
-  [`watchtower/crates/observer`](../watchtower/).
-- See workshop [`AGENTS.md`](../AGENTS.md) for the full classification map.
-
-## Changelog
-
-File: [`./CHANGELOG.md`](./CHANGELOG.md). Format: [Keep a Changelog
-1.1.0](https://keepachangelog.com/en/1.1.0/) with `## [Unreleased]` at
-the top and standard subsections (Added/Changed/Deprecated/Removed/
-Fixed/Security). One bullet per agent change, ≤120 chars,
-present-tense imperative. Branch-type → section mapping per workshop
-[`branch-and-pr-workflow.mdc`](../.cursor/rules/branch-and-pr-workflow.mdc)
-(if cloned outside workshop, the same convention still applies).
-
-Because `ham` is a Rust library consumers pin by `rev = "<sha>"`,
-changelog entries should call out **breaking changes** explicitly
-(rename of public API, change to error semantics, dropped trait impls)
-under `### Changed` or `### Removed`.
-
 ## Repo-specific rules
 
+- **Changelog: call out breaking changes explicitly.** Consumers pin `ham` by `rev = "<sha>"`, so entries for public-API renames, error-semantics changes, or dropped trait impls go under `### Changed` / `### Removed`.
 - **`holochain_client` version pin is load-bearing.** Cargo treats
   pre-release versions as incompatible across consumers. Bumping the pin
   here must be paired with simultaneous bumps in every consumer; otherwise
@@ -90,9 +60,3 @@ under `### Changed` or `### Removed`.
 - **Shutdown-aware everything.** Public APIs that loop or retry must take
   a `ShutdownRx` (or accept one via the call site) so SIGINT/SIGTERM
   cleanly tears down. No infinite loops without a shutdown branch.
-
-## Lessons learned
-
-_Append entries here whenever an agent (or human) loses time to something
-a guardrail would have prevented. Keep each entry: date, short symptom,
-concrete fix._
