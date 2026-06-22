@@ -7,9 +7,12 @@ watchtower).
 ## What it provides
 
 - `Ham` &mdash; a connect-once wrapper around `holochain_client::AppWebsocket`
-  that handles admin-interface discovery, app-interface attach, signing
-  credential authorization, and typed msgpack zome calls with an explicit
-  per-request timeout.
+  that handles admin-interface discovery, app-interface attach, zome-call
+  signing, and typed msgpack zome calls with an explicit per-request timeout.
+  Signs either via lair as the cell's own agent key &mdash; no capability grant
+  committed to the chain (`HamConfig::try_lair_signing_from_node` /
+  `with_lair_signing`) &mdash; or, by default, by authorizing a throwaway
+  signing key on chain (one cap grant per connect).
 - `errors::is_connection_error(&anyhow::Error) -> bool` &mdash; string-based
   classifier that decides whether an error warrants rebuilding the socket
   (covered by unit tests).
@@ -68,10 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Holochain client version
 
-This crate currently pins `holochain_client = "0.8.1-rc.7"`. All consumers
-must align to the same `holochain_client` rc because cargo treats
-pre-release versions as incompatible and `holochain_client` types flow
-across the `ham` crate boundary.
+This crate pins `holochain_client = "0.8.1"`. All consumers must align to the same `holochain_client` version because its types flow across the `ham` crate boundary. Lair signing additionally uses `lair_keystore_api = "0.6.3"` (the version `holochain_client` 0.8.1 resolves) to open the keystore connection for the built-in `holochain_client::LairAgentSigner`.
 
 ## Tracing event names
 
@@ -81,7 +81,8 @@ deployment dashboards can alert on:
 | Event | Level | When |
 | --- | --- | --- |
 | `ham.connecting` | `info` | `Ham::connect` is invoked. |
-| `ham.connected` | `info` | Connection, app info, signing credentials all succeeded. |
+| `ham.connected` | `info` | App websocket connected and signing set up; the `signing` field is `lair` (no cap grant) or `client` (cap grant committed). |
+| `ham.lair_discovery_failed` | `warn` | Lair signing requested but the URL/passphrase couldn't be resolved; fell back to client signing. |
 | `ham.call_zome` | `debug` | Per zome call. |
 | `ham.reconnect.attempt` | `warn` / `error` | Each failed reconnect attempt (`error` after `escalate_after`). |
 | `ham.reconnected` | `info` | Reconnect succeeded after one or more failed attempts. |
