@@ -4,9 +4,9 @@
 //! unyt fleet needs when talking to a Holochain conductor:
 //!
 //! * [`Ham`] &mdash; a thin wrapper around [`holochain_client::AppWebsocket`]
-//!   that handles admin-interface discovery, app-interface attach, signing
-//!   credential authorization, and typed msgpack zome calls with an explicit
-//!   per-request timeout.
+//!   that handles admin-interface discovery, app-interface attach, lair or
+//!   client-side zome-call signing, and typed msgpack zome calls with an
+//!   explicit per-request timeout.
 //! * [`errors::is_connection_error`] &mdash; string-based classifier that
 //!   decides whether an [`anyhow::Error`] warrants rebuilding the socket.
 //! * [`reconnect::connect_with_backoff`] and [`reconnect::compute_delay_ms`]
@@ -22,7 +22,7 @@ pub mod errors;
 pub mod reconnect;
 pub mod shutdown;
 
-pub use client::{Ham, HamConfig};
+pub use client::{Ham, HamConfig, LairSigning};
 pub use errors::{is_connection_error, is_request_timeout, is_source_chain_pressure};
 pub use reconnect::{compute_delay_ms, connect_with_backoff, BackoffConfig};
 pub use shutdown::{install_shutdown_handler, ShutdownRx};

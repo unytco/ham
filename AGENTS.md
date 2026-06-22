@@ -4,14 +4,14 @@
 
 ## Purpose
 
-`library` — production `AppWebsocket` client wrapper used by every Rust service in the Unyt workshop that talks to a Holochain conductor. Wraps `holochain_client::AppWebsocket` and adds connect-once setup, signing credential authorization, typed msgpack zome calls with explicit timeouts, shutdown-aware reconnect with backoff/jitter, and a connection-error classifier.
+`library` — production `AppWebsocket` client wrapper used by every Rust service in the Unyt workshop that talks to a Holochain conductor. Wraps `holochain_client::AppWebsocket` and adds connect-once setup, lair or client-side zome-call signing, typed msgpack zome calls with explicit timeouts, shutdown-aware reconnect with backoff/jitter, and a connection-error classifier.
 
 ## Stack
 
 - Rust crate (no `flake.nix`, no Nix shell required).
 - `tokio` async runtime.
-- Pinned to a single `holochain_client` rc (`0.8.1-rc.7` at time of writing
-  — see [`Cargo.toml`](./Cargo.toml)).
+- Pinned to a single `holochain_client` version (`0.8.1` — see
+  [`Cargo.toml`](./Cargo.toml)).
 
 ## Build
 
