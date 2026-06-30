@@ -13,4 +13,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- upgrade holochain_client to 0.8.1 for Holochain 0.6.1
+- upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0

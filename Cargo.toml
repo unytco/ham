@@ -11,7 +11,7 @@ categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 anyhow = "1"
-holochain_client = "0.8.1"
+holochain_client = "0.8.2-rc.0"
 lair_keystore_api = "0.6.3"
 rmp-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
