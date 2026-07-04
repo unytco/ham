@@ -55,6 +55,12 @@ pub struct HamConfig {
     /// indefinitely. Daemons typically set 60-120 seconds; one-shots can
     /// choose a shorter budget tied to their cron cadence.
     pub request_timeout_secs: u64,
+    /// Skip `list_app_interfaces` discovery and always attach a fresh
+    /// `AllowedOrigins::Any` app interface. Needed when the conductor has
+    /// pre-existing unrestricted app interfaces whose token/origin state
+    /// rejects our anonymous connect — the default discovery would keep
+    /// re-picking the same stale one on every retry.
+    pub force_fresh_attach: bool,
     /// When set, [`Ham::connect`] signs via lair (the cell's own agent key, no
     /// cap grant) instead of authorizing a throwaway signing key on chain.
     pub lair: Option<LairSigning>,
@@ -70,6 +76,7 @@ impl HamConfig {
             app_port,
             app_id: app_id.into(),
             request_timeout_secs: 120,
+            force_fresh_attach: false,
             lair: None,
         }
     }
@@ -77,6 +84,12 @@ impl HamConfig {
     /// Override the per-request timeout (seconds).
     pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
         self.request_timeout_secs = secs;
+        self
+    }
+
+    /// Always attach a fresh app interface, never reuse an existing one.
+    pub fn with_force_fresh_attach(mut self, force: bool) -> Self {
+        self.force_fresh_attach = force;
         self
     }
 
@@ -158,16 +171,7 @@ impl Ham {
             .await
             .context("Failed to connect to admin interface")?;
 
-        let app_interfaces = admin
-            .list_app_interfaces()
-            .await
-            .context("Failed to list app interfaces")?;
-        let app_interface = app_interfaces
-            .iter()
-            .find(|ai| ai.installed_app_id.is_none());
-        let port = if let Some(ai) = app_interface {
-            ai.port
-        } else {
+        let port = if cfg.force_fresh_attach {
             admin
                 .attach_app_interface(
                     cfg.app_port,
@@ -176,7 +180,28 @@ impl Ham {
                     None,
                 )
                 .await
-                .context("Failed to attach app interface")?
+                .context("Failed to attach fresh app interface")?
+        } else {
+            let app_interfaces = admin
+                .list_app_interfaces()
+                .await
+                .context("Failed to list app interfaces")?;
+            let app_interface = app_interfaces
+                .iter()
+                .find(|ai| ai.installed_app_id.is_none());
+            if let Some(ai) = app_interface {
+                ai.port
+            } else {
+                admin
+                    .attach_app_interface(
+                        cfg.app_port,
+                        None,
+                        holochain_client::AllowedOrigins::Any,
+                        None,
+                    )
+                    .await
+                    .context("Failed to attach app interface")?
+            }
         };
 
         let issued_token = admin
