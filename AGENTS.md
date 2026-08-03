@@ -10,8 +10,8 @@
 
 - Rust crate (no `flake.nix`, no Nix shell required).
 - `tokio` async runtime.
-- Pinned to a single `holochain_client` version (`0.8.1` — see
-  [`Cargo.toml`](./Cargo.toml)).
+- Pinned to a single `holochain_client` version (`0.9.0`, the Holochain 0.7
+  line — see [`Cargo.toml`](./Cargo.toml)).
 
 ## Build
 

@@ -14,4 +14,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- upgrade holochain_client to 0.9.0 (and lair_keystore_api to 0.7.1) for Holochain 0.7 — breaking for consumers, who must bump in lockstep because these types cross the `ham` API boundary
 - upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0
