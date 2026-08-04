@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Holochain client version
 
-This crate pins `holochain_client = "0.9.0"` (the Holochain 0.7 line). All consumers must align to the same `holochain_client` version because its types flow across the `ham` crate boundary. Lair signing additionally uses `lair_keystore_api = "0.7.1"` (the version `holochain_client` 0.9.0 resolves) to open the keystore connection for the built-in `holochain_client::LairAgentSigner`.
+This crate pins `holochain_client = "=0.9.0"` exactly (the Holochain 0.7 line). All consumers must align to the same `holochain_client` version because its types flow across the `ham` crate boundary. Lair signing additionally uses `lair_keystore_api = "0.7.1"` (the version `holochain_client` 0.9.0 resolves) to open the keystore connection for the built-in `holochain_client::LairAgentSigner`.
 
 ## Tracing event names
 
