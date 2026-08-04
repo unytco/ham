@@ -14,5 +14,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Error semantics: `is_connection_error` now classifies the `tungstenite` variants a socket going down produces** — `Protocol(SendAfterClosing)`, `AlreadyClosed` and `ConnectionClosed` on the send path, plus `Protocol(ResetWithoutClosingHandshake)` defensively (it is raised only on the read half, whose errors `holochain_client` drops before a caller sees them). The first three reach callers as a `WebsocketError::Websocket(_)` passthrough rendering tungstenite's own text, which matched no needle, so a send-side close left all three classifiers false and the caller neither reconnected nor backed off — it retried straight into a dead socket. Consumers now reconnect on the call that hits one of these rather than on the next one (which got `Close("No connection")`). Matching is additionally **case-insensitive** now, so all seven pre-existing needles widened too — relevant if you feed your own wrapped context strings through the classifier.
 - upgrade holochain_client to 0.9.0, pinned exactly as `=0.9.0` (and lair_keystore_api to 0.7.1) for Holochain 0.7 — breaking for consumers, who must bump in lockstep because these types cross the `ham` API boundary
 - upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0

@@ -12,20 +12,39 @@
 /// suite — see that module for which paths those are, and which are still only
 /// covered by the hand-written strings below.
 pub fn is_connection_error(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:#}");
-    // IMPORTANT: do NOT use a bare `"Websocket error"` needle here. That
+    // Lowercased before matching, so the needles below are all lowercase: this
+    // classifier alone aggregates text from layers that capitalize differently
+    // — tungstenite's `"Connection reset without closing handshake"` vs. an io
+    // error's `"connection reset by peer"`. Its two siblings below stay
+    // case-sensitive on purpose: each matches one exact upstream `Display`
+    // composition, where the case is part of what pins that composition.
+    let msg = format!("{err:#}").to_lowercase();
+    // IMPORTANT: do NOT use a bare `"websocket error"` needle here. That
     // phrase is emitted for both genuine transport failures AND for
     // per-request timeouts (`"Websocket error: Timeout"`), and the latter
     // must NOT trigger a reconnect — the socket is still healthy. See
     // [`is_request_timeout`] for that case.
     const NEEDLES: &[&str] = &[
-        "Websocket closed",
-        "ConnectionClosed",
-        "No connection",
-        "ResetWithoutClosingHandshake",
+        "websocket closed",
+        "no connection",
         "broken pipe",
         "connection reset",
-        "IO error",
+        "io error",
+        // Post-handshake tungstenite owns the stream, so its own text arrives
+        // as a `WebsocketError::Websocket(_)` passthrough sharing no substring
+        // with the needles above. A send walks these as the socket goes down:
+        // `SendAfterClosing` once either side's close frame has landed,
+        // `AlreadyClosed` once it is terminated, and `ConnectionClosed` when
+        // the send syscall itself resets while the state says we can no longer
+        // read.
+        "sending after closing",
+        "trying to work with closed connection",
+        "connection closed",
+        // Retained defensively: no `holochain_websocket 0.7` path renders a
+        // tungstenite error with `{:?}`, so these CamelCase variant names only
+        // reach us from an older or hand-rolled rendering.
+        "connectionclosed",
+        "resetwithoutclosinghandshake",
     ];
     NEEDLES.iter().any(|n| msg.contains(n))
 }
@@ -302,27 +321,23 @@ mod tests {
             assert!(is_connection_error(&e), "got {e:#}");
         }
 
-        /// Characterizes a KNOWN GAP rather than correct behaviour: nothing in
-        /// the needle list matches a `Websocket(_)` passthrough. Two separate
-        /// misses cause it — `"ResetWithoutClosingHandshake"` is the CamelCase
-        /// variant name (what `{:?}` prints, while the classifier only sees
-        /// `{}`), *and* `"connection reset"` misses `"Connection reset …"` on
-        /// case alone. Impact is bounded — the next call gets
-        /// `Close("No connection")` and reconnects — so the fix is deferred
-        /// rather than folded into a dependency bump.
+        /// A peer that vanishes without a closing handshake. This and the
+        /// three below are the `Websocket(_)` passthroughs — post-handshake
+        /// tungstenite owns the stream, so its `Display` text is all the
+        /// classifier sees, never the CamelCase variant names
+        /// (`ResetWithoutClosingHandshake` here), which only `{:?}` prints and
+        /// no `holochain_websocket 0.7` path uses. Caught by
+        /// `"connection reset"` only because the message is lowercased first.
         ///
-        /// **Whoever fixes this: the gap is three variants, not one.**
-        /// `tungstenite::Error::ConnectionClosed` (`"Connection closed
-        /// normally"`) and `Error::AlreadyClosed` (`"Trying to work with closed
-        /// connection"`) are unclassified for the same reason and share no
-        /// substring with the reset text. Lowercasing the comparison fixes only
-        /// this test's case; do not read it going red as the gap being closed.
-        ///
-        /// It asserts the wrong-looking thing on purpose, and is green so it
-        /// runs in CI: it pins the upstream text today, and turns red the
-        /// moment someone repairs the classifier, pointing them here.
+        /// Pinned defensively rather than as a live path: this variant is
+        /// raised only inside `read_message_frame`, and the read half's errors
+        /// are dropped by `holochain_client`'s poll task, so on 0.9 it never
+        /// reaches a `Ham` caller. The three below are the send-path variants
+        /// that do — each only in the window before `close_if_err` tears the
+        /// core down, after which calls short-circuit to
+        /// `Close("No connection")` instead.
         #[test]
-        fn protocol_reset_is_not_yet_classified() {
+        fn protocol_reset_is_a_connection_failure() {
             let e = rendering(
                 ConductorApiError::WebsocketError(WebsocketError::Websocket(Box::new(
                     tungstenite::Error::Protocol(
@@ -332,10 +347,76 @@ mod tests {
                 "Websocket error: Websocket error: WebSocket protocol error: \
                  Connection reset without closing handshake",
             );
-            assert!(
-                !is_connection_error(&e),
-                "classifier repaired — see doc comment"
+            assert!(is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn send_on_a_half_closed_socket_is_a_connection_failure() {
+            // Either side's close frame has landed — the peer's, or our own
+            // during shutdown — but the socket is not terminated yet. What a
+            // send hits *before* `AlreadyClosed`, and so the likeliest.
+            let e = rendering(
+                ConductorApiError::WebsocketError(WebsocketError::Websocket(Box::new(
+                    tungstenite::Error::Protocol(
+                        tungstenite::error::ProtocolError::SendAfterClosing,
+                    ),
+                ))),
+                "Websocket error: Websocket error: WebSocket protocol error: \
+                 Sending after closing is not allowed",
             );
+            assert!(is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn use_after_close_is_a_connection_failure() {
+            // The socket is fully terminated. Upstream calls this a caller
+            // bug; for `Ham` it is the same fact — only a rebuild recovers.
+            let e = rendering(
+                ConductorApiError::WebsocketError(WebsocketError::Websocket(Box::new(
+                    tungstenite::Error::AlreadyClosed,
+                ))),
+                "Websocket error: Websocket error: Trying to work with closed connection",
+            );
+            assert!(is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn peer_closed_the_socket_is_a_connection_failure() {
+            // Not one of `write`'s own gates: the send syscall resets, and
+            // because the state says we can no longer read, tungstenite
+            // reports that reset as a clean close (`check_connection_reset`).
+            // It survives the sink because `poll_ready`'s flush is the one
+            // path that doesn't swallow it — `poll_flush` and `poll_close`
+            // both map it to `Ok(())`.
+            let e = rendering(
+                ConductorApiError::WebsocketError(WebsocketError::Websocket(Box::new(
+                    tungstenite::Error::ConnectionClosed,
+                ))),
+                "Websocket error: Websocket error: Connection closed normally",
+            );
+            assert!(is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn a_signing_failure_is_not_a_connection_failure() {
+            // The negative side pinned to a real upstream value:
+            // `is_connection_error` is consulted first in every consumer's
+            // retry chain, so a future needle that over-broadens would
+            // silently steal cases from the cooldown branch. A signing failure
+            // is the clean counter-example — a real `ConductorApiError` whose
+            // text comes from an `#[error(...)]` attribute, on a healthy
+            // socket that must NOT be rebuilt.
+            let e = rendering(
+                ConductorApiError::SignZomeCallError(
+                    "lair keystore returned no signature".to_string(),
+                ),
+                "Unable to sign zome call: lair keystore returned no signature",
+            );
+            assert!(!is_connection_error(&e), "got {e:#}");
             assert!(!is_request_timeout(&e), "got {e:#}");
         }
     }
