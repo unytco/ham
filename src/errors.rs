@@ -40,9 +40,10 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
         "sending after closing",
         "trying to work with closed connection",
         "connection closed",
-        // Retained defensively: no `holochain_websocket 0.7` path renders a
-        // tungstenite error with `{:?}`, so these CamelCase variant names only
-        // reach us from an older or hand-rolled rendering.
+        // Defensive safety net: the reachable 0.7 renderings of these are
+        // already matched by broader needles above — a `Close("ConnectionClosed")`
+        // payload by `"websocket closed"`, the reset text by `"connection reset"`.
+        // Kept in case a future rendering surfaces the bare variant name instead.
         "connectionclosed",
         "resetwithoutclosinghandshake",
     ];
