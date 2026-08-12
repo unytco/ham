@@ -10,8 +10,7 @@
 
 - Rust crate (no `flake.nix`, no Nix shell required).
 - `tokio` async runtime.
-- Pinned to a single `holochain_client` version (`0.8.1` — see
-  [`Cargo.toml`](./Cargo.toml)).
+- Pinned to a single exact `holochain_client` version (`=0.9.0`, the Holochain 0.7 line — see [`Cargo.toml`](./Cargo.toml)).
 
 ## Build
 
@@ -46,10 +45,7 @@ compatible set of consumer updates has landed.
 ## Repo-specific rules
 
 - **Changelog: call out breaking changes explicitly.** Consumers pin `ham` by `rev = "<sha>"`, so entries for public-API renames, error-semantics changes, or dropped trait impls go under `### Changed` / `### Removed`.
-- **`holochain_client` version pin is load-bearing.** Cargo treats
-  pre-release versions as incompatible across consumers. Bumping the pin
-  here must be paired with simultaneous bumps in every consumer; otherwise
-  the workshop won't build. Open a coordinated PR plan before bumping.
+- **`holochain_client` version pin is load-bearing.** The Holochain crate set is version-locked — a given `holochain_client` pairs with specific conductor/hdk versions — so a consumer resolving a different one won't unify with `ham`. Bumping the pin here must be paired with simultaneous bumps in every consumer; otherwise the workshop won't build. Open a coordinated PR plan before bumping.
 - **Stable tracing event names.** Production dashboards alert on
   `ham.connecting`, `ham.connected`, `ham.call_zome`,
   `ham.reconnect.attempt`, `ham.reconnected`. Renaming is a breaking

@@ -11,9 +11,22 @@ categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 anyhow = "1"
-holochain_client = "0.8.2-rc.0"
-lair_keystore_api = "0.6.3"
+holochain_client = "=0.9.0"
+lair_keystore_api = "0.7.1"
 rmp-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "signal", "sync", "time", "rt"] }
 tracing = "0.1"
+
+[dev-dependencies]
+# Lets the classifier tests build *real* upstream error values instead of
+# hand-written strings; `holochain_client` doesn't re-export `WebsocketError`,
+# so there's no other way to construct one. Must stay on the version
+# `holochain_client` resolves — if the two ranges ever diverge, Cargo builds
+# two distinct `WebsocketError` types and this module stops compiling. Fix that
+# by realigning the range, never by loosening it.
+holochain_websocket = "0.7.0"
+# Post-handshake the socket is tungstenite's, so its io and protocol errors
+# reach us wrapped as `WebsocketError::Websocket(_)`. Same unification rule as
+# above — must match what `holochain_websocket` pulls in via tokio-tungstenite.
+tungstenite = "0.27"

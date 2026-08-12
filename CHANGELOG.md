@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `HamConfig::force_fresh_attach` (+ `with_force_fresh_attach` builder): when set, `Ham::connect` skips `list_app_interfaces` discovery and always attaches a fresh `AllowedOrigins::Any` app interface. Works around conductors that retain stale unrestricted app interfaces whose token/origin state rejects an anonymous connect — the default discovery keeps re-picking the same poisoned one on every retry. Default `false` — the discovery path is unchanged.
-- Lair signing. `HamConfig::try_lair_signing_from_node` (discovers the lair `connection_url` from a conductor config and reads the passphrase file, stripping a trailing newline) and `HamConfig::with_lair_signing` (explicit URL + passphrase) make `Ham::connect` sign zome calls as the cell's own agent key via lair (`holochain_client::LairAgentSigner`) — the implicit `ChainAuthor` grant — so **no capability grant is committed to the source chain**. The default path is unchanged: without lair config, `Ham::connect` still authorizes a throwaway signing key on chain (one cap grant per connect). Discovery failures log a warning and fall back to that default path rather than erroring. Adds a `lair_keystore_api` dependency and re-exports `LairSigning`.
+- `HamConfig::force_fresh_attach` (+ `with_force_fresh_attach` builder) — skip `list_app_interfaces` discovery and always attach a fresh `AllowedOrigins::Any` interface. Default `false`; discovery unchanged.
+- Lair signing — `HamConfig::try_lair_signing_from_node` / `with_lair_signing` make `Ham::connect` sign zome calls as the cell's own agent key, so **no capability grant is committed to the source chain**. Without lair config the throwaway-key path is unchanged.
 
 ### Changed
 
+- `is_connection_error` now classifies the send-path `tungstenite` close variants (`SendAfterClosing`, `AlreadyClosed`, `ConnectionClosed`, `ResetWithoutClosingHandshake`) — a send-side close reconnects instead of retrying a dead socket. Matching is case-insensitive.
+- upgrade holochain_client to `=0.9.0` (and lair_keystore_api to 0.7.1) for Holochain 0.7 — breaking for consumers, who must bump in lockstep.
 - upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0
