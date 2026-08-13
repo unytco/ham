@@ -30,3 +30,13 @@ holochain_websocket = "0.7.0"
 # reach us wrapped as `WebsocketError::Websocket(_)`. Same unification rule as
 # above — must match what `holochain_websocket` pulls in via tokio-tungstenite.
 tungstenite = "0.27"
+# Builds the real `ExternalApiWireError` that `is_source_chain_pressure` keys
+# on. `holochain_client` wraps it in `ConductorApiError::ExternalApiWireError`
+# but re-exports neither the type nor a constructor, so the pinning test needs
+# it directly. Same unification rule (and caret range) as the two above —
+# `holochain_client 0.9.0` already resolves `holochain_conductor_api` 0.7.0
+# transitively, so this resolves the same version (zero extra crates to build);
+# if the ranges ever diverge Cargo builds a second `ExternalApiWireError` type
+# and this module stops compiling. Fix that by realigning the range, never by
+# loosening it.
+holochain_conductor_api = "0.7.0"

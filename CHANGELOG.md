@@ -15,5 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `is_connection_error` now classifies the send-path `tungstenite` close variants (`SendAfterClosing`, `AlreadyClosed`, `ConnectionClosed`, `ResetWithoutClosingHandshake`) — a send-side close reconnects instead of retrying a dead socket. Matching is case-insensitive.
+- `is_connection_error` classifies `ResponderDropped` as a connection error.
+- Pin the error classifiers against real upstream error values.
 - upgrade holochain_client to `=0.9.0` (and lair_keystore_api to 0.7.1) for Holochain 0.7 — breaking for consumers, who must bump in lockstep.
 - upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0

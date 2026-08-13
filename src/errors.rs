@@ -46,6 +46,13 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
         // Kept in case a future rendering surfaces the bare variant name instead.
         "connectionclosed",
         "resetwithoutclosinghandshake",
+        // `holochain_websocket` resolves an in-flight request with
+        // `WebsocketError::Other("ResponderDropped")` when the request's oneshot
+        // responder is dropped before it replies — the connection core tore down
+        // under an outstanding call, so the request is dead and the socket's
+        // state is unknown. Rebuild rather than retry on a socket we can't trust.
+        // (Matched lowercased; the rendered text is the CamelCase variant name.)
+        "responderdropped",
     ];
     NEEDLES.iter().any(|n| msg.contains(n))
 }
@@ -145,6 +152,17 @@ mod tests {
     }
 
     #[test]
+    fn classifies_responder_dropped() {
+        // `holochain_websocket` renders a dropped in-flight responder as
+        // `WebsocketError::Other("ResponderDropped")` → "Other error:
+        // ResponderDropped". The request is dead and the socket's state is
+        // unknown, so reconnect. (Real upstream value pinned in
+        // `upstream_error_text::responder_dropped_is_a_connection_failure`.)
+        let e = wrap("Websocket error: Other error: ResponderDropped");
+        assert!(is_connection_error(&e));
+    }
+
+    #[test]
     fn rejects_decode_error() {
         let e = wrap("Failed to deserialize response: invalid type");
         assert!(!is_connection_error(&e));
@@ -232,21 +250,30 @@ mod tests {
     /// The tests above feed hand-written strings, so they pin only the
     /// classifier. These build the *real* upstream error values and assert the
     /// exact text they render, so a `holochain_client` / `holochain_websocket`
-    /// bump that edits an `#[error(...)]` attribute fails here instead of
-    /// silently misrouting reconnects in production.
+    /// / `holochain_conductor_api` bump that edits an `#[error(...)]` attribute
+    /// — or the `ExternalApiWireError` `Debug` derivation — fails here instead
+    /// of silently misrouting reconnects (or backpressure cooldowns) in
+    /// production.
     ///
-    /// What they do *not* pin, and so must be re-checked by hand on a bump —
-    /// a non-exhaustive list, since neither enum is covered variant by
-    /// variant: the `Close(_)` payloads below are literals copied from
-    /// `holochain_websocket`'s own call sites rather than from a format
-    /// attribute; and `WebsocketError::Other` and
-    /// `ConductorApiError::ExternalApiWireError` are uncovered — the latter
-    /// renders with `{0:?}`, so `is_source_chain_pressure` rides on an
-    /// auto-derived `Debug` that can shift with no `#[error(...)]` edit to
-    /// review and no semver signal.
+    /// Coverage: all three classifiers now have at least one case built from a
+    /// real upstream value, and the three transport errors a caller can receive
+    /// that match *no* classifier by design (`ResponderDropped` →
+    /// `is_connection_error`; `WriteBufferFull` and `Capacity`/message-too-long
+    /// → neither, since backpressure and oversize payloads must not reconnect —
+    /// the consumer's terminal fallback cools down instead) are pinned too, so a
+    /// future needle can't silently steal them into the reconnect path.
+    ///
+    /// What is *not* pinned, and so must be re-checked by hand on a bump: the
+    /// `Close(_)` payloads below are literals copied from `holochain_websocket`'s
+    /// own call sites rather than from a format attribute; and the
+    /// `ExternalApiWireError` case rides on that enum's *auto-derived* `Debug`
+    /// (`ConductorApiError` renders it with `{0:?}`), which can shift with no
+    /// `#[error(...)]` edit to review and no semver signal — the exact-string
+    /// assertion in `source_chain_pressure_wire_error_*` is the only guard.
     mod upstream_error_text {
-        use super::{is_connection_error, is_request_timeout};
+        use super::{is_connection_error, is_request_timeout, is_source_chain_pressure};
         use holochain_client::ConductorApiError;
+        use holochain_conductor_api::ExternalApiWireError;
         use holochain_websocket::WebsocketError;
 
         /// Assert what upstream renders, then hand back the error in the shape
@@ -417,6 +444,94 @@ mod tests {
                 ),
                 "Unable to sign zome call: lair keystore returned no signature",
             );
+            assert!(!is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn responder_dropped_is_a_connection_failure() {
+            // The live gap this closes: an in-flight request whose oneshot
+            // responder is dropped before replying. `holochain_websocket`
+            // surfaces it as `WebsocketError::Other("ResponderDropped")` — the
+            // request is dead and the socket's state is unknown, so the only
+            // safe recovery is a rebuild, not a retry on a socket we can't
+            // trust.
+            let e = rendering(
+                ConductorApiError::WebsocketError(WebsocketError::Other(
+                    "ResponderDropped".to_string(),
+                )),
+                "Websocket error: Other error: ResponderDropped",
+            );
+            assert!(is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn write_buffer_full_is_backpressure_not_a_connection_failure() {
+            // Write backpressure: the peer is reading slower than we write.
+            // Rebuilding the socket would discard the buffered frames and re-run
+            // the handshake to answer a "slow down" signal — exactly wrong. It
+            // must NOT reconnect and must NOT be mistaken for a per-request
+            // timeout; the consumer's terminal fallback cools down instead.
+            // (Defensive: `holochain_websocket` leaves tungstenite's
+            // `max_write_buffer_size` at `usize::MAX`, so nothing raises this
+            // until someone sets a real bound — pinned so a future
+            // `is_connection_error` needle can't silently capture it.)
+            let e = rendering(
+                ConductorApiError::WebsocketError(WebsocketError::Websocket(Box::new(
+                    tungstenite::Error::WriteBufferFull(tungstenite::Message::text("")),
+                ))),
+                "Websocket error: Websocket error: Write buffer is full",
+            );
+            assert!(!is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+            assert!(!is_source_chain_pressure(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn oversize_message_is_not_a_connection_failure() {
+            // A payload past `holochain_websocket`'s message/frame limits.
+            // Permanent for that call — neither reconnecting nor retrying can
+            // make an oversize message fit — so it must NOT reconnect; the
+            // consumer's terminal fallback surfaces and backs off instead of
+            // hot-looping. The `100 > 50` numbers are the pinned rendering of
+            // `CapacityError::MessageTooLong { size, max_size }`.
+            let e = rendering(
+                ConductorApiError::WebsocketError(WebsocketError::Websocket(Box::new(
+                    tungstenite::Error::Capacity(tungstenite::error::CapacityError::MessageTooLong {
+                        size: 100,
+                        max_size: 50,
+                    }),
+                ))),
+                "Websocket error: Websocket error: Space limit exceeded: Message too long: 100 > 50",
+            );
+            assert!(!is_connection_error(&e), "got {e:#}");
+            assert!(!is_request_timeout(&e), "got {e:#}");
+            assert!(!is_source_chain_pressure(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn source_chain_pressure_wire_error_is_pressure_not_a_reconnect() {
+            // The one classifier that had no real-value pin (B105). A conductor
+            // that hits source-chain backpressure answers a zome call with
+            // `AppResponse::Error(ExternalApiWireError)`, which `holochain_client`
+            // wraps as `ConductorApiError::ExternalApiWireError` and renders with
+            // `{0:?}` — so `is_source_chain_pressure` rides on the enum's
+            // auto-derived `Debug`, which can shift with no `#[error(...)]` edit
+            // and no semver signal. This asserts the exact rendered text so such
+            // a shift fails here instead of silently downgrading every consumer's
+            // backpressure cooldown to a no-op. `RibosomeError` is representative:
+            // the classifier keys on the message substring (variant-independent),
+            // while the exact-string assertion pins the `Debug` derivation.
+            let e = rendering(
+                ConductorApiError::ExternalApiWireError(ExternalApiWireError::RibosomeError(
+                    "Source chain error: deadline has elapsed".to_string(),
+                )),
+                "External API wire error: RibosomeError(\"Source chain error: deadline has elapsed\")",
+            );
+            assert!(is_source_chain_pressure(&e), "got {e:#}");
+            // And is neither a socket failure nor a per-request timeout — the
+            // socket is healthy; the conductor is under pressure.
             assert!(!is_connection_error(&e), "got {e:#}");
             assert!(!is_request_timeout(&e), "got {e:#}");
         }
