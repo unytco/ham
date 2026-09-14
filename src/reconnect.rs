@@ -1,10 +1,34 @@
 //! Shutdown-aware exponential-backoff reconnect primitives.
 
 use crate::client::Ham;
+use crate::errors::is_signing_refusal;
 use crate::shutdown::ShutdownRx;
 use std::future::Future;
 use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// How [`connect_with_backoff`] reports one failed attempt. Split out of the
+/// loop so the decision is pinned by a test rather than by reading log output.
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptReport {
+    /// The config has no signing path that avoids writing to the agent's
+    /// chain. No retry can clear it, so it is loud from the first attempt.
+    Refused,
+    /// Enough consecutive failures that an operator should be told.
+    Persistent,
+    /// A failure the loop is expected to ride out.
+    Transient,
+}
+
+fn report_for(err: &anyhow::Error, attempt: u32, cfg: &BackoffConfig) -> AttemptReport {
+    if is_signing_refusal(err) {
+        AttemptReport::Refused
+    } else if attempt >= cfg.escalate_after {
+        AttemptReport::Persistent
+    } else {
+        AttemptReport::Transient
+    }
+}
 
 /// Configuration for [`connect_with_backoff`] and [`compute_delay_ms`].
 #[derive(Debug, Clone)]
@@ -38,6 +62,13 @@ impl Default for BackoffConfig {
 ///
 /// Returns `None` if `shutdown` flips to `true` while we are sleeping or
 /// trying to connect, letting the caller exit cleanly without further I/O.
+///
+/// A [`crate::errors::is_signing_refusal`] failure can never succeed on a
+/// retry, so it is logged at `error!` from the first attempt rather than
+/// warned about and escalated later. The loop still retries it: returning
+/// `None` is how shutdown is reported, and a caller cannot tell the two apart.
+/// Resolve the signing config before entering this loop and a refusal never
+/// reaches it.
 pub async fn connect_with_backoff<F, Fut>(
     factory: F,
     cfg: &BackoffConfig,
@@ -61,21 +92,27 @@ where
             }
             Err(e) => {
                 let delay_ms = compute_delay_ms(attempt, cfg);
-                if attempt >= cfg.escalate_after {
-                    error!(
+                match report_for(&e, attempt, cfg) {
+                    AttemptReport::Refused => error!(
+                        event = "ham.connect.refused",
+                        attempt,
+                        delay_ms,
+                        error = %e,
+                        "connect refused by configuration; no retry can fix this, the config has to change"
+                    ),
+                    AttemptReport::Persistent => error!(
                         event = "ham.reconnect.attempt",
                         attempt,
                         delay_ms,
                         error = %e,
                         "reconnect failing persistently; operator attention needed"
-                    );
-                } else {
-                    warn!(
+                    ),
+                    AttemptReport::Transient => warn!(
                         event = "ham.reconnect.attempt",
                         attempt,
                         delay_ms,
                         error = %e,
-                    );
+                    ),
                 }
                 attempt = attempt.saturating_add(1);
 
@@ -108,6 +145,32 @@ pub fn compute_delay_ms(attempt: u32, cfg: &BackoffConfig) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_refusal_is_loud_from_the_very_first_attempt() {
+        let err = crate::client::refused_connect_error().await;
+        for attempt in [0, 1, cfg().escalate_after, 99] {
+            assert_eq!(
+                report_for(&err, attempt, &cfg()),
+                AttemptReport::Refused,
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_escalates_only_once_it_persists() {
+        let err = anyhow::anyhow!("Websocket error: Websocket closed: No connection");
+        assert_eq!(report_for(&err, 0, &cfg()), AttemptReport::Transient);
+        assert_eq!(
+            report_for(&err, cfg().escalate_after - 1, &cfg()),
+            AttemptReport::Transient
+        );
+        assert_eq!(
+            report_for(&err, cfg().escalate_after, &cfg()),
+            AttemptReport::Persistent
+        );
+    }
 
     fn cfg() -> BackoffConfig {
         BackoffConfig {

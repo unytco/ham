@@ -98,13 +98,46 @@ pub fn is_source_chain_pressure(err: &anyhow::Error) -> bool {
     msg.contains("deadline has elapsed") || msg.contains("Source chain error")
 }
 
+/// Classifies whether an error is [`crate::client::SigningRefused`]: the
+/// config `Ham::connect` was handed had no signing path that does not write to
+/// the agent's chain, so it never connected.
+///
+/// Unlike every other classifier here, this one is not a judgement about
+/// timing. Nothing about a retry can change the verdict, so a caller looping
+/// on connect should stop and surface it rather than wait for it to clear.
+/// Typed rather than string-matched: the refusal is ours, so there is no
+/// upstream wording to track.
+pub fn is_signing_refusal(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<crate::client::SigningRefused>())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_connection_error, is_request_timeout, is_source_chain_pressure};
+    use super::{
+        is_connection_error, is_request_timeout, is_signing_refusal, is_source_chain_pressure,
+    };
     use anyhow::anyhow;
 
     fn wrap(base: &'static str) -> anyhow::Error {
         anyhow!(base).context("Failed to call zome")
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_is_a_refusal_and_not_a_transport_failure() {
+        let err = crate::client::refused_connect_error().await;
+        assert!(is_signing_refusal(&err), "got {err:#}");
+        // A caller's reconnect loop keys on these: a refusal must not look like
+        // a socket to rebuild or a conductor to wait out.
+        assert!(!is_connection_error(&err), "got {err:#}");
+        assert!(!is_request_timeout(&err), "got {err:#}");
+        assert!(!is_source_chain_pressure(&err), "got {err:#}");
+    }
+
+    #[test]
+    fn a_transport_failure_is_not_a_signing_refusal() {
+        assert!(!is_signing_refusal(&wrap(
+            "Websocket error: Websocket closed: No connection"
+        )));
     }
 
     #[test]

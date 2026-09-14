@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 /// Lair connection details that make [`Ham::connect`] sign zome calls as the
 /// cell's own agent key (the implicit `ChainAuthor` grant) instead of
 /// authorizing a throwaway signing key on chain. Built by
-/// [`HamConfig::with_lair_signing`] / [`HamConfig::try_lair_signing_from_node`].
+/// [`HamConfig::with_lair_signing`] / [`HamConfig::with_lair_signing_from_node`].
 #[derive(Clone)]
 pub struct LairSigning {
     /// `lair_server` IPC connection URL (`unix://…?k=<server_pubkey>`).
@@ -64,6 +64,11 @@ pub struct HamConfig {
     /// When set, [`Ham::connect`] signs via lair (the cell's own agent key, no
     /// cap grant) instead of authorizing a throwaway signing key on chain.
     pub lair: Option<LairSigning>,
+    /// Permission to sign by authorizing a throwaway key on chain, which
+    /// commits one capability grant per connect. Without it and without
+    /// [`HamConfig::lair`], [`Ham::connect`] refuses rather than write. Set by
+    /// [`HamConfig::allow_cap_grant_signing`].
+    pub allow_cap_grant_signing: bool,
 }
 
 impl HamConfig {
@@ -78,6 +83,7 @@ impl HamConfig {
             request_timeout_secs: 120,
             force_fresh_attach: false,
             lair: None,
+            allow_cap_grant_signing: false,
         }
     }
 
@@ -96,7 +102,7 @@ impl HamConfig {
     /// Enable lair signing from an explicit connection URL + passphrase bytes
     /// (moved into locked memory; trailing newlines are stripped to match how
     /// the keystore was unlocked). Prefer
-    /// [`HamConfig::try_lair_signing_from_node`] when the values live at the
+    /// [`HamConfig::with_lair_signing_from_node`] when the values live at the
     /// conductor's on-disk paths.
     pub fn with_lair_signing(mut self, connection_url: &str, passphrase: Vec<u8>) -> Result<Self> {
         let connection_url = Url::parse(connection_url)
@@ -108,12 +114,30 @@ impl HamConfig {
         Ok(self)
     }
 
-    /// Try to enable lair signing by discovering the connection URL from a
-    /// Holochain conductor config (`keystore.connection_url`) and the
-    /// passphrase from `passphrase_file`. On any failure — no external
-    /// `lair_server`, unreadable files — this logs a warning and returns
-    /// `self` unchanged, so the caller falls back to the client-signing path
-    /// (which commits a cap grant per connect) rather than failing outright.
+    /// Enable lair signing by discovering the connection URL from a Holochain
+    /// conductor config (`keystore.connection_url`) and the passphrase from
+    /// `passphrase_file`. A node that cannot offer lair fails here, at config
+    /// time and with the reason, instead of at a connect that would have
+    /// written to the chain in its place.
+    pub fn with_lair_signing_from_node(
+        mut self,
+        conductor_config_path: &Path,
+        passphrase_file: &Path,
+    ) -> Result<Self> {
+        self.lair = Some(resolve_lair_from_node(
+            conductor_config_path,
+            passphrase_file,
+        )?);
+        Ok(self)
+    }
+
+    /// Best-effort [`HamConfig::with_lair_signing_from_node`]. On any failure,
+    /// no external `lair_server` or unreadable files, this logs a warning and
+    /// returns `self` with lair signing off, which leaves [`Ham::connect`]
+    /// refusing unless [`HamConfig::allow_cap_grant_signing`] is also set.
+    /// Pair the two to say "lair when the node has it, the chain write when it
+    /// does not". Anything else wants the fallible form, which reports why
+    /// lair was unavailable.
     pub fn try_lair_signing_from_node(
         mut self,
         conductor_config_path: &Path,
@@ -126,10 +150,89 @@ impl HamConfig {
                 conductor_config = %conductor_config_path.display(),
                 passphrase_file = %passphrase_file.display(),
                 error = %e,
-                "lair signing unavailable; falling back to client signing (a cap grant is committed per connect)"
+                "lair signing unavailable; Ham::connect refuses unless allow_cap_grant_signing is set"
             ),
         }
         self
+    }
+
+    /// Ask for the signing path that authorizes a throwaway key by committing
+    /// a capability grant, for a caller that has weighed what that costs: on a
+    /// chain that is already closed the grant is invalid, peers warrant the
+    /// agent for it, and a warranted agent's signed close can never be served
+    /// again. Lair, when configured, still wins: this is permission to write,
+    /// not a request to.
+    pub fn allow_cap_grant_signing(mut self) -> Self {
+        self.allow_cap_grant_signing = true;
+        self
+    }
+}
+
+/// The error [`Ham::connect`] refuses a config with when every signing path
+/// left would write to the agent's chain. Typed, because retrying it can never
+/// succeed: only a config change can, and a caller looping on connect needs to
+/// tell that apart from a conductor that is merely down. Classified by
+/// [`crate::errors::is_signing_refusal`].
+#[derive(Debug)]
+pub struct SigningRefused(String);
+
+impl std::fmt::Display for SigningRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SigningRefused {}
+
+/// How [`Ham::connect`] signs zome calls, decided from the config before
+/// anything is connected.
+#[derive(Debug)]
+enum Signing {
+    /// Sign as the cell's own agent key through lair. Commits nothing.
+    Lair(LairSigning),
+    /// Authorize a throwaway signing key, committing one capability grant to
+    /// the agent's chain per connect. Only reachable through
+    /// [`HamConfig::allow_cap_grant_signing`].
+    CapGrant,
+}
+
+impl Signing {
+    /// Decide the signer, or refuse: with no lair and no opt-in, every signing
+    /// path left writes to the agent's chain, and no caller asked for that.
+    fn resolve(cfg: &HamConfig) -> Result<Self> {
+        if let Some(lair) = cfg.lair.as_ref() {
+            if cfg.allow_cap_grant_signing {
+                // A caller whose own layer resolved "write to the chain" would
+                // otherwise never learn that ham quietly did something safer.
+                warn!(
+                    event = "ham.cap_grant_unused",
+                    "signing through lair: the config permits a capability grant but does not \
+                     need one"
+                );
+            }
+            return Ok(Self::Lair(lair.clone()));
+        }
+        if cfg.allow_cap_grant_signing {
+            return Ok(Self::CapGrant);
+        }
+        Err(anyhow::Error::new(SigningRefused(format!(
+            "refusing to connect to app `{}`: signing it would authorize a throwaway key by \
+             committing a capability grant to the agent's chain, and nothing asked for that \
+             write. On a chain that is already closed the grant is invalid, peers warrant the \
+             agent for it, and its signed close can never be served again. Configure lair \
+             signing (HamConfig::with_lair_signing / with_lair_signing_from_node) to sign with \
+             the cell's own key and write nothing, or call \
+             HamConfig::allow_cap_grant_signing() to ask for that write on purpose.",
+            cfg.app_id
+        ))))
+    }
+
+    /// The `signing` field on the `ham.connecting` / `ham.connected` events.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Lair(_) => "lair",
+            Self::CapGrant => "client",
+        }
     }
 }
 
@@ -152,19 +255,26 @@ impl Ham {
     /// first provisioned cell of `app_id`.
     ///
     /// If `cfg.lair` is set, zome calls are signed with the cell's own agent
-    /// key via lair and **no capability grant is committed**. Otherwise a
-    /// throwaway signing key is authorized on chain (one cap grant per
-    /// connect).
+    /// key via lair and **no capability grant is committed**. Signing without
+    /// lair instead authorizes a throwaway key on chain, one cap grant per
+    /// connect, so it is reachable only through
+    /// [`HamConfig::allow_cap_grant_signing`]. A config carrying neither is
+    /// refused before anything is connected.
     ///
     /// The returned connection honors `cfg.request_timeout_secs` on every
     /// zome call.
     pub async fn connect(cfg: HamConfig) -> Result<Self> {
+        // Before the first socket opens: a config that never asked to write to
+        // the chain must not get as far as being able to.
+        let signing = Signing::resolve(&cfg)?;
+
         info!(
             event = "ham.connecting",
             admin_port = cfg.admin_port,
             app_port = cfg.app_port,
             app_id = cfg.app_id.as_str(),
-            request_timeout_secs = cfg.request_timeout_secs
+            request_timeout_secs = cfg.request_timeout_secs,
+            signing = signing.label()
         );
 
         let admin = AdminWebsocket::connect((Ipv4Addr::LOCALHOST, cfg.admin_port), None)
@@ -227,31 +337,36 @@ impl Ham {
             Client(ClientAgentSigner),
         }
 
-        let (signer, pending): (DynAgentSigner, Pending) = if let Some(lair) = cfg.lair.as_ref() {
-            // The cell lookup (admin) and the lair connection are independent;
-            // run them concurrently — both feed `add_credentials` afterwards.
-            let (cell_id, lair_client) =
-                tokio::try_join!(cell_id_via_admin(&admin, &cfg.app_id), async {
-                    ipc_keystore_connect(lair.connection_url.clone(), lair.passphrase.clone())
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to connect to lair keystore at {}: {}",
-                                lair.connection_url,
-                                e
-                            )
-                        })
-                },)?;
-            // Key the signer on the app's primary (first) provisioned cell —
-            // the same cell the client path authorizes, and the one every
-            // current (single-role) consumer calls. A multi-role app signing a
-            // non-primary role would need per-cell registration here.
-            let mut signer = LairAgentSigner::new(Arc::new(lair_client));
-            signer.add_credentials(cell_id.clone(), cell_id.agent_pubkey().clone());
-            (Arc::new(signer), Pending::Lair(cell_id))
-        } else {
-            let signer = ClientAgentSigner::default();
-            (signer.clone().into(), Pending::Client(signer))
+        let (signer, pending): (DynAgentSigner, Pending) = match &signing {
+            Signing::Lair(lair) => {
+                // The cell lookup (admin) and the lair connection are
+                // independent; run them concurrently — both feed
+                // `add_credentials` afterwards.
+                let (cell_id, lair_client) =
+                    tokio::try_join!(cell_id_via_admin(&admin, &cfg.app_id), async {
+                        ipc_keystore_connect(lair.connection_url.clone(), lair.passphrase.clone())
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to connect to lair keystore at {}: {}",
+                                    lair.connection_url,
+                                    e
+                                )
+                            })
+                    },)?;
+                // Key the signer on the app's primary (first) provisioned cell
+                // — the same cell the client path authorizes, and the one every
+                // current (single-role) consumer calls. A multi-role app
+                // signing a non-primary role would need per-cell registration
+                // here.
+                let mut signer = LairAgentSigner::new(Arc::new(lair_client));
+                signer.add_credentials(cell_id.clone(), cell_id.agent_pubkey().clone());
+                (Arc::new(signer), Pending::Lair(cell_id))
+            }
+            Signing::CapGrant => {
+                let signer = ClientAgentSigner::default();
+                (signer.clone().into(), Pending::Client(signer))
+            }
         };
 
         let app_connection = AppWebsocket::connect_with_config(
@@ -268,6 +383,12 @@ impl Ham {
             Pending::Lair(cell_id) => cell_id,
             Pending::Client(client_signer) => {
                 let cell_id = cell_id_via_app(&app_connection)?;
+                warn!(
+                    event = "ham.cap_grant",
+                    app_id = cfg.app_id.as_str(),
+                    "committing a capability grant to the agent's chain, as asked for by \
+                     allow_cap_grant_signing"
+                );
                 let credentials = admin
                     .authorize_signing_credentials(AuthorizeSigningCredentialsPayload {
                         cell_id: cell_id.clone(),
@@ -282,10 +403,7 @@ impl Ham {
             }
         };
 
-        info!(
-            event = "ham.connected",
-            signing = if cfg.lair.is_some() { "lair" } else { "client" }
-        );
+        info!(event = "ham.connected", signing = signing.label());
 
         Ok(Self {
             app_connection,
@@ -342,6 +460,22 @@ impl Ham {
     /// The [`CellId`] of the first provisioned cell, captured at connect time.
     pub fn cell_id(&self) -> &CellId {
         &self.cell_id
+    }
+}
+
+/// A real refusal, straight from [`Ham::connect`], for the tests across this
+/// crate that need one: they then cannot drift from what connect returns. The
+/// refusal lands before any socket is opened, so the ports are never dialled,
+/// and the bound wait makes a regression that dials them fail rather than hang.
+#[cfg(test)]
+pub(crate) async fn refused_connect_error() -> anyhow::Error {
+    let refused = HamConfig::new(1, 1, "unyt");
+    match tokio::time::timeout(Duration::from_secs(10), Ham::connect(refused))
+        .await
+        .expect("a refusal must not reach the conductor, let alone hang")
+    {
+        Ok(_) => panic!("a config with neither lair nor the opt-in must be refused"),
+        Err(e) => e,
     }
 }
 
@@ -443,7 +577,177 @@ fn strip_passphrase(mut bytes: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_connection_url, strip_passphrase};
+    use super::{parse_connection_url, strip_passphrase, Ham, HamConfig, Signing};
+    use std::time::Duration;
+
+    const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
+
+    fn cfg() -> HamConfig {
+        HamConfig::new(8800, 30000, "unyt")
+    }
+
+    /// A conductor config + passphrase file pair, laid out as
+    /// `with_lair_signing_from_node` reads them off a node.
+    fn node_with_lair() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("conductor-config.yaml"),
+            format!("keystore:\n  type: lair_server\n  connection_url: {LAIR_URL}\n"),
+        )
+        .expect("write conductor config");
+        std::fs::write(dir.path().join("lair-passphrase"), b"deadbeef\n")
+            .expect("write lair passphrase");
+        dir
+    }
+
+    /// A port with nothing listening on it: bound to learn a free one, then
+    /// released as this returns.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the bound address")
+            .port()
+    }
+
+    /// The error a connect against a conductor that isn't there fails with.
+    /// Bounded, so a regression that hangs fails the test instead of the run.
+    async fn connect_error(cfg: HamConfig) -> anyhow::Error {
+        match tokio::time::timeout(Duration::from_secs(10), Ham::connect(cfg))
+            .await
+            .expect("connect must not hang")
+        {
+            Ok(_) => panic!("connect succeeded without a conductor"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn a_config_that_asked_for_nothing_refuses_to_sign() {
+        let err = Signing::resolve(&cfg())
+            .expect_err("no lair and no opt-in must refuse")
+            .to_string();
+        assert!(err.contains("allow_cap_grant_signing"), "{err}");
+        assert!(err.contains("unyt"), "{err}");
+    }
+
+    #[test]
+    fn the_opt_in_selects_the_cap_grant_path() {
+        let signing = Signing::resolve(&cfg().allow_cap_grant_signing())
+            .expect("the opt-in is the one way to reach the cap-grant path");
+        assert!(matches!(signing, Signing::CapGrant));
+        assert_eq!(signing.label(), "client");
+    }
+
+    #[test]
+    fn lair_signing_needs_no_opt_in() {
+        let cfg = cfg()
+            .with_lair_signing(LAIR_URL, b"deadbeef".to_vec())
+            .expect("lair signing from an explicit URL");
+        let signing = Signing::resolve(&cfg).expect("lair commits nothing, so it needs no opt-in");
+        assert_eq!(signing.label(), "lair");
+    }
+
+    #[test]
+    fn lair_wins_over_the_opt_in() {
+        let cfg = cfg()
+            .with_lair_signing(LAIR_URL, b"deadbeef".to_vec())
+            .expect("lair signing from an explicit URL")
+            .allow_cap_grant_signing();
+        let signing = Signing::resolve(&cfg).expect("lair signing stays available");
+        assert_eq!(
+            signing.label(),
+            "lair",
+            "the opt-in permits the chain write, it does not ask for one"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_before_it_touches_the_conductor() {
+        let cfg = HamConfig::new(closed_port(), 30000, "unyt");
+        let err = connect_error(cfg).await;
+        assert!(
+            !crate::errors::is_connection_error(&err),
+            "a refusal is a misconfiguration, not a transport failure a caller should retry: \
+             {err:#}"
+        );
+        let err = format!("{err:#}");
+        assert!(err.contains("refusing to connect"), "{err}");
+        assert!(
+            !err.contains("Failed to connect to admin interface"),
+            "the refusal must land before any socket is opened: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_opt_in_carries_connect_past_the_refusal() {
+        let cfg = HamConfig::new(closed_port(), 30000, "unyt").allow_cap_grant_signing();
+        let err = format!("{:#}", connect_error(cfg).await);
+        assert!(
+            err.contains("Failed to connect to admin interface"),
+            "the opt-in must reach the conductor, where the cap grant would be committed: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lair_carries_connect_past_the_refusal() {
+        let cfg = HamConfig::new(closed_port(), 30000, "unyt")
+            .with_lair_signing(LAIR_URL, b"deadbeef".to_vec())
+            .expect("lair signing from an explicit URL");
+        let err = format!("{:#}", connect_error(cfg).await);
+        assert!(
+            err.contains("Failed to connect to admin interface"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn with_lair_signing_from_node_reads_the_node() {
+        let dir = node_with_lair();
+        let cfg = cfg()
+            .with_lair_signing_from_node(
+                &dir.path().join("conductor-config.yaml"),
+                &dir.path().join("lair-passphrase"),
+            )
+            .expect("a node with an external lair_server configures lair signing");
+        assert_eq!(
+            cfg.lair
+                .as_ref()
+                .expect("lair signing")
+                .connection_url
+                .as_str(),
+            LAIR_URL
+        );
+        assert!(
+            !cfg.allow_cap_grant_signing,
+            "reading a node's lair is not permission to write to its chain"
+        );
+    }
+
+    #[test]
+    fn with_lair_signing_from_node_fails_loudly() {
+        let dir = node_with_lair();
+        let missing = dir.path().join("absent-conductor-config.yaml");
+        let err = cfg()
+            .with_lair_signing_from_node(&missing, &dir.path().join("lair-passphrase"))
+            .expect_err("a node without a conductor config cannot offer lair")
+            .to_string();
+        assert!(err.contains("absent-conductor-config.yaml"), "{err}");
+    }
+
+    #[test]
+    fn try_lair_signing_from_node_leaves_the_config_refusing() {
+        let dir = node_with_lair();
+        let cfg = cfg().try_lair_signing_from_node(
+            &dir.path().join("absent-conductor-config.yaml"),
+            &dir.path().join("lair-passphrase"),
+        );
+        assert!(cfg.lair.is_none());
+        assert!(
+            Signing::resolve(&cfg).is_err(),
+            "a failed discovery must not leave the caller on the chain-writing path"
+        );
+    }
 
     #[test]
     fn parse_connection_url_reads_lair_server_url() {
@@ -460,8 +764,13 @@ data_root_path: /var/lib/holochain/data
 
     #[test]
     fn parse_connection_url_rejects_non_lair_server() {
-        let cfg = "keystore:\n  type: danger_test_keystore\n";
-        assert!(parse_connection_url(cfg).is_err());
+        // Carries a connection_url, so the only thing that can reject it is the
+        // type check itself.
+        let cfg = "keystore:\n  type: danger_test_keystore\n  connection_url: unix:///x?k=y\n";
+        let err = parse_connection_url(cfg)
+            .expect_err("only an external lair_server exposes a connectable socket")
+            .to_string();
+        assert!(err.contains("danger_test_keystore"), "{err}");
     }
 
     #[test]
