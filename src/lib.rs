@@ -7,6 +7,9 @@
 //!   that handles admin-interface discovery, app-interface attach, lair or
 //!   client-side zome-call signing, and typed msgpack zome calls with an
 //!   explicit per-request timeout.
+//! * [`SigningPolicy`] and [`HamConfig::with_signing`]: the lair-or-refuse
+//!   decision, made once here from a caller's own inputs rather than rebuilt by
+//!   every consumer.
 //! * [`errors::is_connection_error`] &mdash; string-based classifier that
 //!   decides whether an [`anyhow::Error`] warrants rebuilding the socket.
 //! * [`reconnect::connect_with_backoff`] and [`reconnect::compute_delay_ms`]
@@ -22,7 +25,9 @@ pub mod errors;
 pub mod reconnect;
 pub mod shutdown;
 
-pub use client::{Ham, HamConfig, LairSigning, SigningRefused};
+pub use client::{
+    CapGrantOptIn, Ham, HamConfig, LairCredentials, LairSigning, SigningPolicy, SigningRefused,
+};
 pub use errors::{
     is_connection_error, is_request_timeout, is_signing_refusal, is_source_chain_pressure,
 };

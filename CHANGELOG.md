@@ -9,12 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `HamConfig::with_signing` and `SigningPolicy`: the lair-or-refuse decision, made here once from a caller's own inputs. Supply `LairCredentials::Values` for values you already resolved or `LairCredentials::Node` for the conductor's paths, plus a `CapGrantOptIn` that `from_value` parses from an operator-supplied value and `from_flag` from a parsed flag. The refusal carries the generic fault, and the caller names its own variables or flags as `anyhow` context.
 - `HamConfig::force_fresh_attach` (+ `with_force_fresh_attach` builder) — skip `list_app_interfaces` discovery and always attach a fresh `AllowedOrigins::Any` interface. Default `false`; discovery unchanged.
-- Lair signing — `HamConfig::with_lair_signing_from_node` / `with_lair_signing` make `Ham::connect` sign zome calls as the cell's own agent key, so **no capability grant is committed to the source chain**.
+- Lair signing: `Ham::connect` signs zome calls as the cell's own agent key, so **no capability grant is committed to the source chain**.
+
+### Removed
+
+- `HamConfig::try_lair_signing_from_node`. Its "lair when the node has it, the chain write when it does not" is now `with_signing(LairCredentials::Node { .. }, CapGrantOptIn::Permitted)`, which states the fallback instead of leaving a silently refusing config behind.
+- `HamConfig::with_lair_signing_from_node`, which was `with_signing(LairCredentials::Node { .. }, CapGrantOptIn::Withheld)` spelled a second way.
 
 ### Changed
 
-- `Ham::connect` refuses a config that has neither lair signing nor `HamConfig::allow_cap_grant_signing()`, so connecting never commits a capability grant nobody asked for. The new `HamConfig::with_lair_signing_from_node` reports why lair was unavailable instead of falling back to that write, and `is_signing_refusal` tells a reconnect loop that a refusal is a config to fix rather than a conductor to wait for.
+- `CapGrantOptIn::Permitted` covers one case: there is no lair to reach. A credential that was supplied and cannot be used, half of a pair or a URL that will not parse, is fatal whichever way the opt-in is set, so a typo can never become a capability grant committed to the agent's chain.
+- `ham.cap_grant_unused` logs at `info`, not `warn`: a caller that permits the capability grant and has lair too is signing through lair, which is the intended outcome and not a fault.
+- `Ham::connect` refuses a config that has neither lair signing nor `HamConfig::allow_cap_grant_signing()`, so connecting never commits a capability grant nobody asked for. A node that cannot offer lair reports why instead of falling back to that write, and `is_signing_refusal` tells a reconnect loop that a refusal is a config to fix rather than a conductor to wait for.
 - `is_connection_error` now classifies the send-path `tungstenite` close variants (`SendAfterClosing`, `AlreadyClosed`, `ConnectionClosed`, `ResetWithoutClosingHandshake`) — a send-side close reconnects instead of retrying a dead socket. Matching is case-insensitive.
 - `is_connection_error` classifies `ResponderDropped` as a connection error.
 - Pin the error classifiers against real upstream error values.
