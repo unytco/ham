@@ -22,7 +22,9 @@ pub mod errors;
 pub mod reconnect;
 pub mod shutdown;
 
-pub use client::{Ham, HamConfig, LairSigning};
-pub use errors::{is_connection_error, is_request_timeout, is_source_chain_pressure};
+pub use client::{Ham, HamConfig, LairSigning, SigningRefused};
+pub use errors::{
+    is_connection_error, is_request_timeout, is_signing_refusal, is_source_chain_pressure,
+};
 pub use reconnect::{compute_delay_ms, connect_with_backoff, BackoffConfig};
 pub use shutdown::{install_shutdown_handler, ShutdownRx};

@@ -40,3 +40,6 @@ tungstenite = "0.27"
 # and this module stops compiling. Fix that by realigning the range, never by
 # loosening it.
 holochain_conductor_api = "0.7.0"
+
+# Temp conductor-config / passphrase fixtures for the lair-discovery tests.
+tempfile = "3"

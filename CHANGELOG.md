@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `HamConfig::force_fresh_attach` (+ `with_force_fresh_attach` builder) — skip `list_app_interfaces` discovery and always attach a fresh `AllowedOrigins::Any` interface. Default `false`; discovery unchanged.
-- Lair signing — `HamConfig::try_lair_signing_from_node` / `with_lair_signing` make `Ham::connect` sign zome calls as the cell's own agent key, so **no capability grant is committed to the source chain**. Without lair config the throwaway-key path is unchanged.
+- Lair signing — `HamConfig::with_lair_signing_from_node` / `with_lair_signing` make `Ham::connect` sign zome calls as the cell's own agent key, so **no capability grant is committed to the source chain**.
 
 ### Changed
 
+- `Ham::connect` refuses a config that has neither lair signing nor `HamConfig::allow_cap_grant_signing()`, so connecting never commits a capability grant nobody asked for. The new `HamConfig::with_lair_signing_from_node` reports why lair was unavailable instead of falling back to that write, and `is_signing_refusal` tells a reconnect loop that a refusal is a config to fix rather than a conductor to wait for.
 - `is_connection_error` now classifies the send-path `tungstenite` close variants (`SendAfterClosing`, `AlreadyClosed`, `ConnectionClosed`, `ResetWithoutClosingHandshake`) — a send-side close reconnects instead of retrying a dead socket. Matching is case-insensitive.
 - `is_connection_error` classifies `ResponderDropped` as a connection error.
 - Pin the error classifiers against real upstream error values.
