@@ -17,6 +17,17 @@ rmp-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "signal", "sync", "time", "rt"] }
 tracing = "0.1"
+# The conductor's own `KeystoreConfig`, so a node's keystore is classified
+# exactly as the conductor loading that config classifies it, and its
+# `ExternalApiWireError`, which `errors::is_source_chain_pressure` keys on.
+# `holochain_client 0.9.0` already resolves this version transitively, so this
+# costs no extra crate to build; the ranges must stay aligned, because if they
+# diverge Cargo builds two distinct copies of these types and the crate stops
+# compiling. Fix that by realigning the range, never by loosening it. A caret
+# where its sibling is an exact pin, deliberately: inside one Holochain line a
+# field added upstream can only turn a config ham refuses into one it accepts,
+# so a conductor patched within its line keeps signing without a ham release.
+holochain_conductor_api = "0.7.0"
 
 [dev-dependencies]
 # Lets the classifier tests build *real* upstream error values instead of
@@ -30,16 +41,5 @@ holochain_websocket = "0.7.0"
 # reach us wrapped as `WebsocketError::Websocket(_)`. Same unification rule as
 # above — must match what `holochain_websocket` pulls in via tokio-tungstenite.
 tungstenite = "0.27"
-# Builds the real `ExternalApiWireError` that `is_source_chain_pressure` keys
-# on. `holochain_client` wraps it in `ConductorApiError::ExternalApiWireError`
-# but re-exports neither the type nor a constructor, so the pinning test needs
-# it directly. Same unification rule (and caret range) as the two above —
-# `holochain_client 0.9.0` already resolves `holochain_conductor_api` 0.7.0
-# transitively, so this resolves the same version (zero extra crates to build);
-# if the ranges ever diverge Cargo builds a second `ExternalApiWireError` type
-# and this module stops compiling. Fix that by realigning the range, never by
-# loosening it.
-holochain_conductor_api = "0.7.0"
-
 # Temp conductor-config / passphrase fixtures for the lair-discovery tests.
 tempfile = "3"

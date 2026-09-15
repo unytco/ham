@@ -169,7 +169,14 @@ pub enum LairCredentials {
         /// Passphrase bytes that unlock it.
         passphrase: Option<Vec<u8>>,
     },
-    /// The conductor's own files, read when the policy resolves.
+    /// The conductor's own files, read when the policy resolves. A node naming
+    /// no external `lair_server`, or with no conductor config there at all, has
+    /// no lair to reach: the absence [`CapGrantOptIn::Permitted`] falls back
+    /// from. A config that names one and cannot be used is fatal either way, as
+    /// is a config this build cannot read: it is read with the
+    /// `ConductorConfig` ham is pinned to, so any key that schema does not
+    /// define, anywhere in the document and from a Holochain either side of the
+    /// pin, refuses rather than falls back.
     Node {
         /// Config whose `keystore.connection_url` names the keystore.
         conductor_config: PathBuf,
@@ -256,10 +263,7 @@ impl LairCredentials {
             Self::Node {
                 conductor_config,
                 passphrase_file,
-            } => match resolve_lair_from_node(&conductor_config, &passphrase_file) {
-                Ok(signer) => Offered::Signer(signer),
-                Err(e) => Offered::NoLair(Some(e)),
-            },
+            } => resolve_lair_from_node(&conductor_config, &passphrase_file),
         }
     }
 }
@@ -703,50 +707,94 @@ fn cell_id_via_app(app: &AppWebsocket) -> Result<CellId> {
     first_provisioned_cell(app.cached_app_info())
 }
 
-/// Read the lair connection URL + passphrase from the conductor's on-disk
-/// paths (see [`LairCredentials::Node`]).
-fn resolve_lair_from_node(
-    conductor_config_path: &Path,
-    passphrase_file: &Path,
-) -> Result<LairSigning> {
-    let config_text = std::fs::read_to_string(conductor_config_path).with_context(|| {
-        format!(
-            "reading conductor config {}",
+/// Read a node's lair connection URL + passphrase, as the two answers
+/// [`LairCredentials::Node`] documents.
+fn resolve_lair_from_node(conductor_config_path: &Path, passphrase_file: &Path) -> Offered {
+    let named = |e: anyhow::Error| {
+        e.context(format!(
+            "conductor config {}",
             conductor_config_path.display()
-        )
-    })?;
-    let connection_url = parse_connection_url(&config_text)?;
-    let raw = std::fs::read(passphrase_file)
-        .with_context(|| format!("reading lair passphrase {}", passphrase_file.display()))?;
-    Ok(LairSigning {
-        connection_url,
-        passphrase: lock_passphrase(raw),
-    })
+        ))
+    };
+    let config_text = match std::fs::read_to_string(conductor_config_path) {
+        Ok(text) => text,
+        // A path nothing is at names no lair. A path something is at that will
+        // not read is a node we could not ask, which is not an answer of no.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Offered::NoLair(Some(named(anyhow::Error::new(e))))
+        }
+        Err(e) => return Offered::Unusable(named(anyhow::Error::new(e))),
+    };
+    let connection_url = match parse_keystore(&config_text) {
+        Ok(NodeKeystore::LairServer(url)) => url,
+        Ok(NodeKeystore::NoExternalLair(why)) => return Offered::NoLair(Some(named(why))),
+        Err(e) => return Offered::Unusable(named(e)),
+    };
+    match std::fs::read(passphrase_file) {
+        Ok(raw) => Offered::Signer(LairSigning {
+            connection_url,
+            passphrase: lock_passphrase(raw),
+        }),
+        Err(e) => Offered::Unusable(anyhow::Error::new(e).context(format!(
+            "reading lair passphrase {} for the `lair_server` named by {}",
+            passphrase_file.display(),
+            conductor_config_path.display()
+        ))),
+    }
 }
 
-/// Pluck the lair `keystore.connection_url` from a Holochain conductor config.
-/// Errors unless the keystore is an external `lair_server` — the only kind that
-/// exposes a connectable socket.
-fn parse_connection_url(config_text: &str) -> Result<Url> {
+/// What a conductor config says about an external lair.
+enum NodeKeystore {
+    /// An external `lair_server`, at this URL.
+    LairServer(Url),
+    /// A config naming a keystore that exposes no connectable socket, and why.
+    NoExternalLair(anyhow::Error),
+}
+
+/// Read what a Holochain conductor config says about its keystore, through the
+/// conductor's own `ConductorConfig`, so ham reads a config exactly when the
+/// conductor loading it would. A misspelt keystore `type`, a field belonging to
+/// another keystore, a key belonging to no conductor config at all: each is a
+/// config no conductor is running, so none is read as a node saying it has no
+/// lair. A config that omits the keystore section is not one of those: the
+/// conductor defaults it to the in-process keystore, which is a genuine
+/// absence.
+fn parse_keystore(config_text: &str) -> Result<NodeKeystore> {
+    use holochain_conductor_api::config::conductor::{ConductorConfig, KeystoreConfig};
     use lair_keystore_api::dependencies::serde_yaml;
     let doc: serde_yaml::Value =
         serde_yaml::from_str(config_text).context("parsing conductor config YAML")?;
-    let keystore = doc
-        .get("keystore")
-        .context("conductor config has no `keystore` section")?;
-    let kind = keystore
-        .get("type")
-        .and_then(|t| t.as_str())
-        .context("conductor config keystore has no `type`")?;
+    // serde renders the value it rejects, so no scalar reaches it: a passphrase
+    // file read as a conductor config by mistake is one, and hex carries no
+    // colon to parse as anything else. An unknown key or variant tag still
+    // renders, which is what names the wrong file when the paths are swapped.
+    anyhow::ensure!(doc.is_mapping(), "is not a YAML mapping");
     anyhow::ensure!(
-        kind == "lair_server",
-        "conductor keystore type is `{kind}`, not `lair_server` — no external lair to connect to"
+        doc.get("keystore")
+            .is_none_or(serde_yaml::Value::is_mapping),
+        "`keystore` is not a mapping"
     );
-    let url = keystore
-        .get("connection_url")
-        .and_then(|u| u.as_str())
-        .context("conductor config keystore has no `connection_url`")?;
-    Url::parse(url).with_context(|| format!("invalid lair connection_url `{url}`"))
+    // Read with the `ConductorConfig` this build is pinned to, so a config a
+    // newer Holochain wrote is refused rather than read loosely.
+    let config: ConductorConfig =
+        serde_yaml::from_value(doc).context("is not a conductor config ham can read")?;
+    let kind = match config.keystore {
+        KeystoreConfig::LairServer { connection_url } => {
+            // Through the text rather than the type: `url2` declares its own
+            // `url` dependency, which resolves to the one the keystore client
+            // uses until some graph resolves two.
+            return Url::parse(connection_url.as_str())
+                .map(NodeKeystore::LairServer)
+                .with_context(|| format!("invalid lair connection_url `{connection_url}`"));
+        }
+        // Exhaustive on purpose: a keystore added upstream must stop compiling
+        // here rather than be read as an absence.
+        KeystoreConfig::LairServerInProc { .. } => "lair_server_in_proc",
+        KeystoreConfig::DangerTestKeystore => "danger_test_keystore",
+    };
+    Ok(NodeKeystore::NoExternalLair(anyhow::anyhow!(
+        "keystore is `{kind}`, not an external `lair_server`, so there is no lair to connect to"
+    )))
 }
 
 /// Move passphrase bytes into locked memory as a [`SharedLockedArray`], after
@@ -770,8 +818,8 @@ fn strip_passphrase(mut bytes: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_connection_url, strip_passphrase, CapGrantOptIn, Ham, HamConfig, LairCredentials,
-        SigningPolicy,
+        parse_keystore, strip_passphrase, CapGrantOptIn, Ham, HamConfig, LairCredentials,
+        NodeKeystore, SigningPolicy,
     };
     use std::time::Duration;
 
@@ -785,14 +833,18 @@ mod tests {
     /// [`LairCredentials::Node`] reads them off a node.
     fn node_with_lair() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("conductor-config.yaml"),
-            format!("keystore:\n  type: lair_server\n  connection_url: {LAIR_URL}\n"),
-        )
-        .expect("write conductor config");
+        write_conductor_config(
+            &dir,
+            "conductor-config.yaml",
+            &format!("keystore:\n  type: lair_server\n  connection_url: {LAIR_URL}\n"),
+        );
         std::fs::write(dir.path().join("lair-passphrase"), b"deadbeef\n")
             .expect("write lair passphrase");
         dir
+    }
+
+    fn write_conductor_config(dir: &tempfile::TempDir, name: &str, body: &str) {
+        std::fs::write(dir.path().join(name), body).expect("write conductor config");
     }
 
     /// A port with nothing listening on it: bound to learn a free one, then
@@ -1123,6 +1175,214 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_nodes_malformed_lair_url_is_fatal_even_where_the_opt_in_is_granted() {
+        // The lair is there, so falling back would commit a capability grant
+        // to the agent's chain over one wrong character.
+        let dir = node_with_lair();
+        write_conductor_config(
+            &dir,
+            "typo.yaml",
+            "keystore:\n  type: lair_server\n  connection_url: unix//lair?k=abc\n",
+        );
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(node(&dir, "typo.yaml"), CapGrantOptIn::Permitted)
+                .expect_err("a lair_server URL that will not parse is a typo, not an absent lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("unix//lair?k=abc"), "{err}");
+        assert!(err.contains("typo.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_nodes_missing_passphrase_file_is_fatal_even_where_the_opt_in_is_granted() {
+        let dir = node_with_lair();
+        std::fs::remove_file(dir.path().join("lair-passphrase")).expect("remove the passphrase");
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                node(&dir, "conductor-config.yaml"),
+                CapGrantOptIn::Permitted
+            )
+            .expect_err("a passphrase file that cannot be read is not an absent lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("lair-passphrase"), "{err}");
+        // Which config made a missing passphrase fatal, rather than the
+        // fallback the caller asked for with `Permitted`.
+        assert!(err.contains("conductor-config.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_conductor_config_that_cannot_be_read_is_not_an_absent_one() {
+        // A directory stands in for the unreadable file: no chmod, and it
+        // stays unreadable when the tests run as root.
+        let dir = node_with_lair();
+        std::fs::create_dir(dir.path().join("a-directory.yaml")).expect("create the directory");
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(node(&dir, "a-directory.yaml"), CapGrantOptIn::Permitted)
+                .expect_err("an unreadable conductor config is not a node without lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("a-directory.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_half_written_conductor_config_is_not_an_absent_lair() {
+        // A config that exists and says nothing usable is not a config saying
+        // "no lair here": a hand edit that truncates in place leaves one.
+        let dir = node_with_lair();
+        for (name, body) in [("empty.yaml", ""), ("half-written.yaml", "keystore:\n")] {
+            write_conductor_config(&dir, name, body);
+            let err = format!(
+                "{:#}",
+                SigningPolicy::resolve(node(&dir, name), CapGrantOptIn::Permitted)
+                    .expect_err("a config that cannot be read is not a config that says no")
+            );
+            assert!(err.contains("lair signing is required"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_node_with_no_external_lair_still_reaches_the_opt_ins_fallback() {
+        // The case the opt-in exists for: a conductor whose keystore exposes
+        // no socket to attach to, such as the sandbox unyt_cli is pointed at.
+        let dir = node_with_lair();
+        for (name, body) in [
+            ("in-proc.yaml", "keystore:\n  type: lair_server_in_proc\n"),
+            (
+                "in-proc-rooted.yaml",
+                "keystore:\n  type: lair_server_in_proc\n  lair_root: /x/ks\n",
+            ),
+            ("danger.yaml", "keystore:\n  type: danger_test_keystore\n"),
+            // `ConductorConfig::keystore` is `#[serde(default)]`, so a config
+            // that omits the section runs the in-process keystore: a conductor
+            // with no socket to attach to, not a file to refuse.
+            (
+                "no-keystore.yaml",
+                "data_root_path: /var/lib/holochain/data\n",
+            ),
+            ("empty-mapping.yaml", "{}\n"),
+        ] {
+            write_conductor_config(&dir, name, body);
+            let cfg = cfg()
+                .with_signing(node(&dir, name), CapGrantOptIn::Permitted)
+                .unwrap_or_else(|e| panic!("{name}: no external lair is an absence: {e:#}"));
+            assert!(cfg.lair.is_none(), "{name}");
+            assert!(cfg.allow_cap_grant_signing, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_fleet_conductor_config_signs_through_lair() {
+        // The config heart renders onto every fleet node, whole, because the
+        // whole document is read: if a Holochain upgrade moves a key the fleet
+        // writes, every node refuses to sign, and this is where that has to
+        // fail instead.
+        let dir = node_with_lair();
+        write_conductor_config(
+            &dir,
+            "fleet.yaml",
+            &format!(
+                "---\n\
+                 tracing_override: ~\n\
+                 data_root_path: \"/var/lib/holochain/data\"\n\
+                 keystore:\n  \
+                 type: lair_server\n  \
+                 connection_url: {LAIR_URL}\n\
+                 admin_interfaces:\n  \
+                 - driver:\n      \
+                 type: websocket\n      \
+                 port: 8800\n      \
+                 danger_bind_addr: ~\n      \
+                 allowed_origins: \"*\"\n\
+                 network:\n  \
+                 base64_auth_material_bootstrap: ~\n  \
+                 base64_auth_material_relay: ~\n  \
+                 bootstrap_url: \"https://bootstrap.unyt.example\"\n  \
+                 relay_url: \"wss://relay.unyt.example\"\n  \
+                 target_arc_factor: 1\n  \
+                 advanced: null\n  \
+                 request_timeout_s: 60\n\
+                 tuning_params: null\n\
+                 tracing_scope: null\n"
+            ),
+        );
+        let cfg = cfg()
+            .with_signing(node(&dir, "fleet.yaml"), CapGrantOptIn::Withheld)
+            .expect("the fleet's own conductor config must reach lair signing");
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            LAIR_URL
+        );
+    }
+
+    #[test]
+    fn a_config_the_conductor_would_reject_is_fatal_even_where_the_opt_in_is_granted() {
+        // `KeystoreConfig` names three keystores, and `ConductorConfig` takes
+        // no key it does not define, so each of these is a config no conductor
+        // is running. The near misses are what an operator actually types.
+        let dir = node_with_lair();
+        for (name, body, needle) in [
+            (
+                "misspelt-type.yaml",
+                format!("keystore:\n  type: lair_sever\n  connection_url: {LAIR_URL}\n"),
+                "lair_sever",
+            ),
+            (
+                "wrong-case-type.yaml",
+                format!("keystore:\n  type: LairServer\n  connection_url: {LAIR_URL}\n"),
+                "LairServer",
+            ),
+            (
+                "in-proc-with-a-url.yaml",
+                format!("keystore:\n  type: lair_server_in_proc\n  connection_url: {LAIR_URL}\n"),
+                "connection_url",
+            ),
+            // Broken outside the keystore, so only reading the whole document
+            // catches it.
+            (
+                "unknown-top-level-key.yaml",
+                "keystore:\n  type: lair_server_in_proc\nbogus_top_level: 1\n".to_string(),
+                "bogus_top_level",
+            ),
+        ] {
+            write_conductor_config(&dir, name, &body);
+            let err = format!(
+                "{:#}",
+                SigningPolicy::resolve(node(&dir, name), CapGrantOptIn::Permitted)
+                    .expect_err("a keystore the conductor would reject is not an absent lair")
+            );
+            assert!(err.contains("lair signing is required"), "{name}: {err}");
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_conductor_config_is_fatal_even_where_the_opt_in_is_granted() {
+        // The conductor config path pointed at lair's own config, its sibling
+        // in the same directory. `ConductorConfig` defines none of its keys, so
+        // it is a file no conductor was started from.
+        let dir = node_with_lair();
+        write_conductor_config(
+            &dir,
+            "lair-keystore-config.yaml",
+            "connectionUrl: unix:///x?k=y\npidFile: /x/pid\nstoreFile: /x/store\n",
+        );
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                node(&dir, "lair-keystore-config.yaml"),
+                CapGrantOptIn::Permitted
+            )
+            .expect_err("a file that is not a conductor config cannot say a node has no lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("lair-keystore-config.yaml"), "{err}");
+    }
+
     #[tokio::test]
     async fn connect_refuses_before_it_touches_the_conductor() {
         let cfg = HamConfig::new(closed_port(), 30000, "unyt");
@@ -1163,48 +1423,77 @@ mod tests {
         );
     }
 
+    /// The reason a config gives for naming no external lair, for the tests
+    /// that assert it answered rather than failed to answer.
+    fn no_external_lair(config_text: &str) -> String {
+        match parse_keystore(config_text).expect("a config that answers") {
+            NodeKeystore::NoExternalLair(why) => format!("{why:#}"),
+            NodeKeystore::LairServer(url) => panic!("expected no external lair, got {url}"),
+        }
+    }
+
     #[test]
-    fn parse_connection_url_reads_lair_server_url() {
+    fn parse_keystore_reads_a_lair_server_url() {
         let cfg = "\
 keystore:
   type: lair_server
   connection_url: unix:///var/lib/holochain/lair/socket?k=abc123
 data_root_path: /var/lib/holochain/data
 ";
-        let url = parse_connection_url(cfg).expect("should parse a lair_server connection_url");
+        let NodeKeystore::LairServer(url) =
+            parse_keystore(cfg).expect("should parse a lair_server connection_url")
+        else {
+            panic!("an external lair_server is a lair to reach");
+        };
         assert_eq!(url.scheme(), "unix");
         assert!(url.as_str().contains("k=abc123"), "got {}", url.as_str());
     }
 
     #[test]
-    fn parse_connection_url_rejects_non_lair_server() {
-        // Carries a connection_url, so the only thing that can reject it is the
-        // type check itself.
+    fn parse_keystore_reads_a_non_lair_server_as_no_external_lair() {
+        // Carries a connection_url, so the only thing that can classify it is
+        // the type check itself.
         let cfg = "keystore:\n  type: danger_test_keystore\n  connection_url: unix:///x?k=y\n";
-        let err = parse_connection_url(cfg)
-            .expect_err("only an external lair_server exposes a connectable socket")
-            .to_string();
-        assert!(err.contains("danger_test_keystore"), "{err}");
+        let why = no_external_lair(cfg);
+        assert!(why.contains("danger_test_keystore"), "{why}");
     }
 
     #[test]
-    fn parse_connection_url_errors_without_url() {
-        let cfg = "keystore:\n  type: lair_server\n";
-        assert!(parse_connection_url(cfg).is_err());
+    fn parse_keystore_errors_when_a_lair_server_names_no_url() {
+        assert!(parse_keystore("keystore:\n  type: lair_server\n").is_err());
     }
 
     #[test]
-    fn parse_connection_url_errors_without_keystore() {
-        let cfg = "data_root_path: /var/lib/holochain/data\n";
-        assert!(parse_connection_url(cfg).is_err());
-    }
-
-    #[test]
-    fn parse_connection_url_errors_without_type() {
+    fn parse_keystore_errors_without_a_type() {
         // A keystore section carrying a connection_url but no `type` must be
-        // rejected, not assumed to be a lair_server.
-        let cfg = "keystore:\n  connection_url: unix:///x?k=y\n";
-        assert!(parse_connection_url(cfg).is_err());
+        // rejected, not assumed to be a lair_server and not read as an absence.
+        assert!(parse_keystore("keystore:\n  connection_url: unix:///x?k=y\n").is_err());
+    }
+
+    #[test]
+    fn parse_keystore_errors_on_what_is_not_a_conductor_config() {
+        for cfg in [
+            "",
+            "just a string\n",
+            "- one\n- two\n",
+            "connectionUrl: unix:///x?k=y\npidFile: /x/pid\n",
+        ] {
+            assert!(parse_keystore(cfg).is_err(), "{cfg:?}");
+        }
+    }
+
+    #[test]
+    fn parse_keystore_never_renders_what_it_rejects() {
+        // The conductor config path pointed at the passphrase file, whole and
+        // as somebody's `keystore`. serde renders the value it rejects, so the
+        // passphrase must stop before it.
+        for cfg in ["deadbeefs3cr3t\n", "keystore: s3cr3t\n"] {
+            let Err(e) = parse_keystore(cfg) else {
+                panic!("{cfg:?} is not a conductor config");
+            };
+            let err = format!("{e:#}");
+            assert!(!err.contains("s3cr3t"), "{err}");
+        }
     }
 
     #[test]
