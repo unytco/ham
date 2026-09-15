@@ -14,15 +14,14 @@ use lair_keystore_api::ipc_keystore_connect;
 use lair_keystore_api::types::SharedLockedArray;
 use serde::de::DeserializeOwned;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Lair connection details that make [`Ham::connect`] sign zome calls as the
 /// cell's own agent key (the implicit `ChainAuthor` grant) instead of
-/// authorizing a throwaway signing key on chain. Built by
-/// [`HamConfig::with_lair_signing`] / [`HamConfig::with_lair_signing_from_node`].
+/// authorizing a throwaway signing key on chain.
 #[derive(Clone)]
 pub struct LairSigning {
     /// `lair_server` IPC connection URL (`unix://…?k=<server_pubkey>`).
@@ -99,11 +98,12 @@ impl HamConfig {
         self
     }
 
-    /// Enable lair signing from an explicit connection URL + passphrase bytes
-    /// (moved into locked memory; trailing newlines are stripped to match how
-    /// the keystore was unlocked). Prefer
-    /// [`HamConfig::with_lair_signing_from_node`] when the values live at the
-    /// conductor's on-disk paths.
+    /// Set the lair signer field directly, from a connection URL and
+    /// passphrase bytes (moved into locked memory; trailing newlines are
+    /// stripped to match how the keystore was unlocked). The field-level
+    /// primitive, for a caller assembling a config piece by piece;
+    /// [`HamConfig::with_signing`] is the way in for a caller that wants the
+    /// decision made for it.
     pub fn with_lair_signing(mut self, connection_url: &str, passphrase: Vec<u8>) -> Result<Self> {
         let connection_url = Url::parse(connection_url)
             .with_context(|| format!("Invalid lair connection URL: {connection_url}"))?;
@@ -114,46 +114,12 @@ impl HamConfig {
         Ok(self)
     }
 
-    /// Enable lair signing by discovering the connection URL from a Holochain
-    /// conductor config (`keystore.connection_url`) and the passphrase from
-    /// `passphrase_file`. A node that cannot offer lair fails here, at config
-    /// time and with the reason, instead of at a connect that would have
-    /// written to the chain in its place.
-    pub fn with_lair_signing_from_node(
-        mut self,
-        conductor_config_path: &Path,
-        passphrase_file: &Path,
-    ) -> Result<Self> {
-        self.lair = Some(resolve_lair_from_node(
-            conductor_config_path,
-            passphrase_file,
-        )?);
-        Ok(self)
-    }
-
-    /// Best-effort [`HamConfig::with_lair_signing_from_node`]. On any failure,
-    /// no external `lair_server` or unreadable files, this logs a warning and
-    /// returns `self` with lair signing off, which leaves [`Ham::connect`]
-    /// refusing unless [`HamConfig::allow_cap_grant_signing`] is also set.
-    /// Pair the two to say "lair when the node has it, the chain write when it
-    /// does not". Anything else wants the fallible form, which reports why
-    /// lair was unavailable.
-    pub fn try_lair_signing_from_node(
-        mut self,
-        conductor_config_path: &Path,
-        passphrase_file: &Path,
-    ) -> Self {
-        match resolve_lair_from_node(conductor_config_path, passphrase_file) {
-            Ok(lair) => self.lair = Some(lair),
-            Err(e) => warn!(
-                event = "ham.lair_discovery_failed",
-                conductor_config = %conductor_config_path.display(),
-                passphrase_file = %passphrase_file.display(),
-                error = %e,
-                "lair signing unavailable; Ham::connect refuses unless allow_cap_grant_signing is set"
-            ),
-        }
-        self
+    /// Decide this config's signing path from the inputs the caller holds, and
+    /// write the decision onto it. Name your own variables or flags as `anyhow`
+    /// context on the error, so the naming stays where the names are. See
+    /// [`SigningPolicy::resolve`] for the rules.
+    pub fn with_signing(self, lair: LairCredentials, opt_in: CapGrantOptIn) -> Result<Self> {
+        Ok(SigningPolicy::resolve(lair, opt_in)?.apply(self))
     }
 
     /// Ask for the signing path that authorizes a throwaway key by committing
@@ -168,8 +134,10 @@ impl HamConfig {
     }
 }
 
-/// The error [`Ham::connect`] refuses a config with when every signing path
-/// left would write to the agent's chain. Typed, because retrying it can never
+/// The error a signing decision fails with when nothing was offered to sign
+/// with and every path left would write to the agent's chain. A credential that
+/// was offered but cannot be used fails with a plain error instead, because it
+/// names a specific thing to fix. Typed, because retrying it can never
 /// succeed: only a config change can, and a caller looping on connect needs to
 /// tell that apart from a conductor that is merely down. Classified by
 /// [`crate::errors::is_signing_refusal`].
@@ -184,54 +152,283 @@ impl std::fmt::Display for SigningRefused {
 
 impl std::error::Error for SigningRefused {}
 
-/// How [`Ham::connect`] signs zome calls, decided from the config before
-/// anything is connected.
-#[derive(Debug)]
-enum Signing {
+/// The generic half of every refusal: the fault, carrying no consumer's
+/// variable or flag names. Callers add those as `anyhow` context.
+const LAIR_REQUIRED: &str = "lair signing is required and unavailable";
+
+/// Where a caller's lair credentials come from. Consumers hold them in one of
+/// two forms: a service whose installer rendered the values into its
+/// environment already has them, and a process running beside the conductor
+/// has the paths to read them off.
+pub enum LairCredentials {
+    /// Values the caller resolved itself. Both halves are needed; one without
+    /// the other is a typo, not a signing path.
+    Values {
+        /// `lair_server` IPC connection URL (`unix://…?k=<server_pubkey>`).
+        connection_url: Option<String>,
+        /// Passphrase bytes that unlock it.
+        passphrase: Option<Vec<u8>>,
+    },
+    /// The conductor's own files, read when the policy resolves. A node naming
+    /// no external `lair_server`, or with neither file on it, has no lair to
+    /// reach: the absence [`CapGrantOptIn::Permitted`] falls back from. A
+    /// passphrase with no conductor config beside it is a provisioned node and
+    /// a path to fix, not an absence.
+    ///
+    /// A config that names a lair and cannot be used is fatal either way, as is
+    /// a config this build cannot read: it is read with the `ConductorConfig`
+    /// ham is pinned to, so any key that schema does not define, anywhere in
+    /// the document and from a Holochain either side of the pin, refuses rather
+    /// than falls back.
+    Node {
+        /// Config whose `keystore.connection_url` names the keystore.
+        conductor_config: PathBuf,
+        /// File holding the passphrase that unlocks it.
+        passphrase_file: PathBuf,
+    },
+    /// The caller has no lair to offer. The same answer as `Values` with both
+    /// halves absent, for a caller that has no lair concept at all.
+    Absent,
+}
+
+impl std::fmt::Debug for LairCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Never render the passphrase.
+            Self::Values { connection_url, .. } => f
+                .debug_struct("Values")
+                .field("connection_url", connection_url)
+                .field("passphrase", &"<redacted>")
+                .finish(),
+            Self::Node {
+                conductor_config,
+                passphrase_file,
+            } => f
+                .debug_struct("Node")
+                .field("conductor_config", conductor_config)
+                .field("passphrase_file", passphrase_file)
+                .finish(),
+            Self::Absent => f.write_str("Absent"),
+        }
+    }
+}
+
+/// What reading a caller's credentials produced. The two failures are
+/// different questions: whether there is a lair to reach, and whether what the
+/// caller handed over can be used. Only the first is what the opt-in is for.
+enum Offered {
+    /// A usable signer.
+    Signer(LairSigning),
+    /// No lair to sign with, through no fault of the caller's input: it offered
+    /// none, or the node it named has none to reach. Carries the reason where
+    /// there is one.
+    NoLair(Option<anyhow::Error>),
+    /// The caller offered something that cannot be used.
+    Unusable(anyhow::Error),
+}
+
+impl LairCredentials {
+    fn resolve(self) -> Offered {
+        match self {
+            Self::Absent
+            | Self::Values {
+                connection_url: None,
+                passphrase: None,
+            } => Offered::NoLair(None),
+            Self::Values {
+                connection_url: Some(connection_url),
+                passphrase: Some(passphrase),
+            } => {
+                // Parsed here rather than at connect: left to the connection an
+                // unusable URL surfaces as a transport failure, which a
+                // supervised loop retries forever.
+                match Url::parse(&connection_url) {
+                    Ok(url) => Offered::Signer(LairSigning {
+                        connection_url: url,
+                        // An empty passphrase is accepted deliberately: lair
+                        // can be provisioned with one, so rejecting it here
+                        // would refuse a node that does work.
+                        passphrase: lock_passphrase(passphrase),
+                    }),
+                    Err(e) => Offered::Unusable(anyhow::Error::new(e).context(format!(
+                        "the lair connection URL is not a URL: `{connection_url}`"
+                    ))),
+                }
+            }
+            Self::Values { connection_url, .. } => Offered::Unusable(anyhow::anyhow!(
+                "{}",
+                if connection_url.is_some() {
+                    "the lair connection URL is set and its passphrase is not"
+                } else {
+                    "the lair passphrase is set and its connection URL is not"
+                }
+            )),
+            Self::Node {
+                conductor_config,
+                passphrase_file,
+            } => resolve_lair_from_node(&conductor_config, &passphrase_file),
+        }
+    }
+}
+
+/// Whether the caller will accept the signing path that authorizes a throwaway
+/// key by committing a capability grant to the agent's chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapGrantOptIn {
+    /// Not asked for: lair, or a refusal.
+    Withheld,
+    /// Permission to sign that way where there is no other way. Lair wins
+    /// wherever it is available, so this is never a request to write.
+    Permitted,
+}
+
+impl CapGrantOptIn {
+    /// Read the opt-in from an operator-supplied value. `1`, `true`, `yes` and
+    /// `on` are [`CapGrantOptIn::Permitted`]; `0`, `false`, `no`, `off`, an
+    /// empty value and an absent one are [`CapGrantOptIn::Withheld`]. Anything
+    /// else is an error rather than a guess: the value permits the path that
+    /// writes to the chain, so it is never inferred. Name the variable it came
+    /// from as `anyhow` context.
+    pub fn from_value(raw: Option<&str>) -> Result<Self> {
+        let Some(value) = raw else {
+            return Ok(Self::Withheld);
+        };
+        let value = value.trim();
+        if ["1", "true", "yes", "on"]
+            .iter()
+            .any(|on| value.eq_ignore_ascii_case(on))
+        {
+            return Ok(Self::Permitted);
+        }
+        if ["", "0", "false", "no", "off"]
+            .iter()
+            .any(|off| value.eq_ignore_ascii_case(off))
+        {
+            return Ok(Self::Withheld);
+        }
+        anyhow::bail!("expected one of 1/true/yes/on or 0/false/no/off, got `{value}`")
+    }
+
+    /// Read the opt-in from a flag the caller already parsed.
+    pub fn from_flag(set: bool) -> Self {
+        if set {
+            Self::Permitted
+        } else {
+            Self::Withheld
+        }
+    }
+}
+
+/// How zome calls will be signed, decided before anything is connected so that
+/// a caller which never asked to write to the chain never gets as far as being
+/// able to. Resolve it once from the caller's inputs and [`SigningPolicy::apply`]
+/// it to every [`HamConfig`] a connection is built from.
+#[derive(Debug, Clone)]
+pub struct SigningPolicy(Decision);
+
+#[derive(Debug, Clone)]
+enum Decision {
     /// Sign as the cell's own agent key through lair. Commits nothing.
     Lair(LairSigning),
     /// Authorize a throwaway signing key, committing one capability grant to
-    /// the agent's chain per connect. Only reachable through
-    /// [`HamConfig::allow_cap_grant_signing`].
+    /// the agent's chain per connect.
     CapGrant,
 }
 
-impl Signing {
-    /// Decide the signer, or refuse: with no lair and no opt-in, every signing
-    /// path left writes to the agent's chain, and no caller asked for that.
-    fn resolve(cfg: &HamConfig) -> Result<Self> {
-        if let Some(lair) = cfg.lair.as_ref() {
-            if cfg.allow_cap_grant_signing {
-                // A caller whose own layer resolved "write to the chain" would
-                // otherwise never learn that ham quietly did something safer.
-                warn!(
+impl SigningPolicy {
+    /// Decide the signing path from what the caller has: its lair credentials
+    /// in whichever form it holds them, and whether it permits the capability
+    /// grant.
+    ///
+    /// Lair wins wherever it resolves. [`CapGrantOptIn::Permitted`] then covers
+    /// exactly one case: there is no lair to reach. A credential the caller
+    /// supplied and got wrong is a misconfiguration to fix, so it is fatal
+    /// whichever way the opt-in is set; a typo is not "no other way", and
+    /// falling back on one would write to the chain because of a typo.
+    ///
+    /// Fails with [`SigningRefused`] where nothing was offered and the opt-in
+    /// is withheld, because every signing path left writes to the agent's
+    /// chain.
+    pub fn resolve(lair: LairCredentials, opt_in: CapGrantOptIn) -> Result<Self> {
+        let unavailable = match lair.resolve() {
+            Offered::Signer(signer) => return Self::decide(Some(signer), opt_in),
+            Offered::Unusable(e) => return Err(e.context(LAIR_REQUIRED)),
+            Offered::NoLair(why) => why,
+        };
+        match (opt_in, unavailable) {
+            (CapGrantOptIn::Withheld, Some(e)) => Err(e.context(LAIR_REQUIRED)),
+            (CapGrantOptIn::Withheld, None) => Self::decide(None, opt_in),
+            (CapGrantOptIn::Permitted, why) => {
+                if let Some(e) = why {
+                    warn!(
+                        event = "ham.lair_unavailable",
+                        error = %format!("{e:#}"),
+                        "no lair to reach; taking the capability grant this caller permitted"
+                    );
+                }
+                Self::decide(None, opt_in)
+            }
+        }
+    }
+
+    /// The decision [`Ham::connect`] makes for a config assembled field by
+    /// field rather than through [`SigningPolicy::resolve`]. A config the
+    /// policy wrote, and has not been edited since, decides the same way here.
+    fn from_config(cfg: &HamConfig) -> Result<Self> {
+        Self::decide(
+            cfg.lair.clone(),
+            CapGrantOptIn::from_flag(cfg.allow_cap_grant_signing),
+        )
+    }
+
+    /// Every signing decision comes through here.
+    fn decide(signer: Option<LairSigning>, opt_in: CapGrantOptIn) -> Result<Self> {
+        if let Some(signer) = signer {
+            if opt_in == CapGrantOptIn::Permitted {
+                // The expected outcome for a caller that carries the permission
+                // permanently, so it reports rather than warns.
+                info!(
                     event = "ham.cap_grant_unused",
-                    "signing through lair: the config permits a capability grant but does not \
-                     need one"
+                    "signing through lair: the caller permits a capability grant and none is \
+                     needed"
                 );
             }
-            return Ok(Self::Lair(lair.clone()));
+            return Ok(Self(Decision::Lair(signer)));
         }
-        if cfg.allow_cap_grant_signing {
-            return Ok(Self::CapGrant);
+        if opt_in == CapGrantOptIn::Withheld {
+            return Err(anyhow::Error::new(SigningRefused(format!(
+                "refusing to connect: {LAIR_REQUIRED}, and the only signing path left authorizes \
+                 a throwaway key by committing a capability grant to this agent's chain, which \
+                 nothing asked for. On a chain that is already closed that action is invalid, \
+                 peers warrant the agent for it, and its signed close can never be served again. \
+                 Supply lair credentials to sign with the cell's own key and write nothing, or \
+                 permit that write on purpose with CapGrantOptIn::Permitted."
+            ))));
         }
-        Err(anyhow::Error::new(SigningRefused(format!(
-            "refusing to connect to app `{}`: signing it would authorize a throwaway key by \
-             committing a capability grant to the agent's chain, and nothing asked for that \
-             write. On a chain that is already closed the grant is invalid, peers warrant the \
-             agent for it, and its signed close can never be served again. Configure lair \
-             signing (HamConfig::with_lair_signing / with_lair_signing_from_node) to sign with \
-             the cell's own key and write nothing, or call \
-             HamConfig::allow_cap_grant_signing() to ask for that write on purpose.",
-            cfg.app_id
-        ))))
+        Ok(Self(Decision::CapGrant))
+    }
+
+    /// Write the decision onto a config, so it carries the decision and nothing
+    /// stale can be read out of it.
+    pub fn apply(&self, mut cfg: HamConfig) -> HamConfig {
+        match &self.0 {
+            Decision::Lair(signer) => {
+                cfg.lair = Some(signer.clone());
+                cfg.allow_cap_grant_signing = false;
+            }
+            Decision::CapGrant => {
+                cfg.lair = None;
+                cfg.allow_cap_grant_signing = true;
+            }
+        }
+        cfg
     }
 
     /// The `signing` field on the `ham.connecting` / `ham.connected` events.
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Lair(_) => "lair",
-            Self::CapGrant => "client",
+    pub fn label(&self) -> &'static str {
+        match self.0 {
+            Decision::Lair(_) => "lair",
+            Decision::CapGrant => "client",
         }
     }
 }
@@ -259,14 +456,16 @@ impl Ham {
     /// lair instead authorizes a throwaway key on chain, one cap grant per
     /// connect, so it is reachable only through
     /// [`HamConfig::allow_cap_grant_signing`]. A config carrying neither is
-    /// refused before anything is connected.
+    /// refused before anything is connected. [`HamConfig::with_signing`]
+    /// decides all of that from a caller's own inputs.
     ///
     /// The returned connection honors `cfg.request_timeout_secs` on every
     /// zome call.
     pub async fn connect(cfg: HamConfig) -> Result<Self> {
         // Before the first socket opens: a config that never asked to write to
         // the chain must not get as far as being able to.
-        let signing = Signing::resolve(&cfg)?;
+        let signing =
+            SigningPolicy::from_config(&cfg).with_context(|| format!("app `{}`", cfg.app_id))?;
 
         info!(
             event = "ham.connecting",
@@ -337,8 +536,8 @@ impl Ham {
             Client(ClientAgentSigner),
         }
 
-        let (signer, pending): (DynAgentSigner, Pending) = match &signing {
-            Signing::Lair(lair) => {
+        let (signer, pending): (DynAgentSigner, Pending) = match &signing.0 {
+            Decision::Lair(lair) => {
                 // The cell lookup (admin) and the lair connection are
                 // independent; run them concurrently — both feed
                 // `add_credentials` afterwards.
@@ -363,7 +562,7 @@ impl Ham {
                 signer.add_credentials(cell_id.clone(), cell_id.agent_pubkey().clone());
                 (Arc::new(signer), Pending::Lair(cell_id))
             }
-            Signing::CapGrant => {
+            Decision::CapGrant => {
                 let signer = ClientAgentSigner::default();
                 (signer.clone().into(), Pending::Client(signer))
             }
@@ -511,50 +710,125 @@ fn cell_id_via_app(app: &AppWebsocket) -> Result<CellId> {
     first_provisioned_cell(app.cached_app_info())
 }
 
-/// Read the lair connection URL + passphrase from the conductor's on-disk
-/// paths (see [`HamConfig::try_lair_signing_from_node`]).
-fn resolve_lair_from_node(
-    conductor_config_path: &Path,
-    passphrase_file: &Path,
-) -> Result<LairSigning> {
-    let config_text = std::fs::read_to_string(conductor_config_path).with_context(|| {
-        format!(
-            "reading conductor config {}",
+/// Read a node's lair connection URL + passphrase, as the two answers
+/// [`LairCredentials::Node`] documents.
+fn resolve_lair_from_node(conductor_config_path: &Path, passphrase_file: &Path) -> Offered {
+    let named = |e: anyhow::Error| {
+        e.context(format!(
+            "conductor config {}",
             conductor_config_path.display()
-        )
-    })?;
-    let connection_url = parse_connection_url(&config_text)?;
-    let raw = std::fs::read(passphrase_file)
-        .with_context(|| format!("reading lair passphrase {}", passphrase_file.display()))?;
-    Ok(LairSigning {
-        connection_url,
-        passphrase: lock_passphrase(raw),
-    })
+        ))
+    };
+    let config_text = match std::fs::read_to_string(conductor_config_path) {
+        Ok(text) => text,
+        // A path something is at that will not read is a node we could not ask,
+        // which is not an answer of no.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Offered::Unusable(named(anyhow::Error::new(e)))
+        }
+        // Neither file is a node with no lair. A passphrase still sitting there
+        // is a node that was provisioned with one, so the config path is what
+        // is wrong, and falling back would write to the chain of a node whose
+        // lair is reachable. Only `NotFound` is absent: a path that will not
+        // stat is one we cannot call absent.
+        Err(e) => {
+            return match std::fs::metadata(passphrase_file).err().map(|m| m.kind()) {
+                Some(std::io::ErrorKind::NotFound) => {
+                    Offered::NoLair(Some(named(anyhow::Error::new(e))))
+                }
+                _ => Offered::Unusable(anyhow::anyhow!(
+                    "no conductor config at {} and a lair passphrase at {}: this node has lair \
+                     credentials and a config path that does not name them, so fix the path, or \
+                     remove the passphrase if the install it belongs to is gone",
+                    conductor_config_path.display(),
+                    passphrase_file.display()
+                )),
+            }
+        }
+    };
+    let connection_url = match parse_keystore(&config_text) {
+        Ok(NodeKeystore::LairServer(url)) => url,
+        Ok(NodeKeystore::NoExternalLair(why)) => return Offered::NoLair(Some(named(why))),
+        Err(e) => return Offered::Unusable(named(e)),
+    };
+    match std::fs::read(passphrase_file) {
+        Ok(raw) => Offered::Signer(LairSigning {
+            connection_url,
+            passphrase: lock_passphrase(raw),
+        }),
+        Err(e) => Offered::Unusable(anyhow::Error::new(e).context(format!(
+            "reading lair passphrase {} for the `lair_server` named by {}",
+            passphrase_file.display(),
+            conductor_config_path.display()
+        ))),
+    }
 }
 
-/// Pluck the lair `keystore.connection_url` from a Holochain conductor config.
-/// Errors unless the keystore is an external `lair_server` — the only kind that
-/// exposes a connectable socket.
-fn parse_connection_url(config_text: &str) -> Result<Url> {
+/// What a conductor config says about an external lair.
+enum NodeKeystore {
+    /// An external `lair_server`, at this URL.
+    LairServer(Url),
+    /// A config naming a keystore that exposes no connectable socket, and why.
+    NoExternalLair(anyhow::Error),
+}
+
+/// Read what a Holochain conductor config says about its keystore, through the
+/// conductor's own `ConductorConfig`, so ham reads a config exactly when the
+/// conductor loading it would. A misspelt keystore `type`, a field belonging to
+/// another keystore, a key belonging to no conductor config at all: each is a
+/// config no conductor is running, so none is read as a node saying it has no
+/// lair. A config that omits the keystore section is not one of those: the
+/// conductor defaults it to the in-process keystore, which is a genuine
+/// absence.
+fn parse_keystore(config_text: &str) -> Result<NodeKeystore> {
+    use holochain_conductor_api::config::conductor::{ConductorConfig, KeystoreConfig};
     use lair_keystore_api::dependencies::serde_yaml;
     let doc: serde_yaml::Value =
         serde_yaml::from_str(config_text).context("parsing conductor config YAML")?;
-    let keystore = doc
-        .get("keystore")
-        .context("conductor config has no `keystore` section")?;
-    let kind = keystore
-        .get("type")
-        .and_then(|t| t.as_str())
-        .context("conductor config keystore has no `type`")?;
+    // serde renders the key or the value it rejects, so a scalar stops here: a
+    // generated passphrase read as a conductor config by mistake is one.
+    anyhow::ensure!(doc.is_mapping(), "is not a YAML mapping");
     anyhow::ensure!(
-        kind == "lair_server",
-        "conductor keystore type is `{kind}`, not `lair_server` — no external lair to connect to"
+        doc.get("keystore")
+            .is_none_or(serde_yaml::Value::is_mapping),
+        "`keystore` is not a mapping"
     );
-    let url = keystore
-        .get("connection_url")
-        .and_then(|u| u.as_str())
-        .context("conductor config keystore has no `connection_url`")?;
-    Url::parse(url).with_context(|| format!("invalid lair connection_url `{url}`"))
+    // Read with the `ConductorConfig` this build is pinned to, so a config a
+    // newer Holochain wrote is refused rather than read loosely.
+    let names_a_keystore = doc.get("keystore").is_some();
+    let config: ConductorConfig = serde_yaml::from_value(doc).map_err(|e| {
+        // A hand-set passphrase carrying a colon parses as a mapping, and serde
+        // would render its key, or everything after the colon as a value. A
+        // file naming no keystore is not a conductor config, so serde's text is
+        // dropped there rather than repeated into journald by the `error!` on
+        // every reconnect attempt. Kept where a keystore section is present:
+        // that file is a real config, and the field it got wrong is what an
+        // operator needs to fix it.
+        if names_a_keystore {
+            anyhow::Error::new(e).context("is not a conductor config ham can read")
+        } else {
+            anyhow::anyhow!(
+                "names no `keystore` section, and is not a conductor config ham can read"
+            )
+        }
+    })?;
+    let kind = match config.keystore {
+        KeystoreConfig::LairServer { connection_url } => {
+            // Through the text rather than the type: `url2` declares its own
+            // `url` dependency, which resolves to the one the keystore client
+            // uses until some graph resolves two.
+            return Url::parse(connection_url.as_str())
+                .map(NodeKeystore::LairServer)
+                .with_context(|| format!("invalid lair connection_url `{connection_url}`"));
+        }
+        // Exhaustive on purpose: a keystore added upstream must stop compiling
+        // here rather than be read as an absence.
+        KeystoreConfig::LairServerInProc { .. } => "lair_server_in_proc",
+        KeystoreConfig::DangerTestKeystore => "danger_test_keystore",
+    };
+    Ok(NodeKeystore::NoExternalLair(anyhow::anyhow!(
+        "keystore is `{kind}`, not an external `lair_server`, so there is no lair to connect to"
+    )))
 }
 
 /// Move passphrase bytes into locked memory as a [`SharedLockedArray`], after
@@ -577,7 +851,10 @@ fn strip_passphrase(mut bytes: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_connection_url, strip_passphrase, Ham, HamConfig, Signing};
+    use super::{
+        parse_keystore, strip_passphrase, CapGrantOptIn, Ham, HamConfig, LairCredentials,
+        NodeKeystore, SigningPolicy,
+    };
     use std::time::Duration;
 
     const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
@@ -587,17 +864,27 @@ mod tests {
     }
 
     /// A conductor config + passphrase file pair, laid out as
-    /// `with_lair_signing_from_node` reads them off a node.
+    /// [`LairCredentials::Node`] reads them off a node.
     fn node_with_lair() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(
-            dir.path().join("conductor-config.yaml"),
-            format!("keystore:\n  type: lair_server\n  connection_url: {LAIR_URL}\n"),
-        )
-        .expect("write conductor config");
+        write_conductor_config(
+            &dir,
+            "conductor-config.yaml",
+            &format!("keystore:\n  type: lair_server\n  connection_url: {LAIR_URL}\n"),
+        );
         std::fs::write(dir.path().join("lair-passphrase"), b"deadbeef\n")
             .expect("write lair passphrase");
         dir
+    }
+
+    fn write_conductor_config(dir: &tempfile::TempDir, name: &str, body: &str) {
+        std::fs::write(dir.path().join(name), body).expect("write conductor config");
+    }
+
+    /// A node with neither file on it: the machine `unyt_cli` runs a local
+    /// sandbox on, pointed at the fleet's paths by default.
+    fn node_with_nothing() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
     }
 
     /// A port with nothing listening on it: bound to learn a free one, then
@@ -622,20 +909,33 @@ mod tests {
         }
     }
 
+    fn values(connection_url: Option<&str>, passphrase: Option<&str>) -> LairCredentials {
+        LairCredentials::Values {
+            connection_url: connection_url.map(str::to_string),
+            passphrase: passphrase.map(|p| p.as_bytes().to_vec()),
+        }
+    }
+
+    fn node(dir: &tempfile::TempDir, conductor_config: &str) -> LairCredentials {
+        LairCredentials::Node {
+            conductor_config: dir.path().join(conductor_config),
+            passphrase_file: dir.path().join("lair-passphrase"),
+        }
+    }
+
     #[test]
     fn a_config_that_asked_for_nothing_refuses_to_sign() {
-        let err = Signing::resolve(&cfg())
+        let err = SigningPolicy::from_config(&cfg())
             .expect_err("no lair and no opt-in must refuse")
             .to_string();
-        assert!(err.contains("allow_cap_grant_signing"), "{err}");
-        assert!(err.contains("unyt"), "{err}");
+        assert!(err.contains("refusing to connect"), "{err}");
+        assert!(err.contains("CapGrantOptIn"), "{err}");
     }
 
     #[test]
     fn the_opt_in_selects_the_cap_grant_path() {
-        let signing = Signing::resolve(&cfg().allow_cap_grant_signing())
+        let signing = SigningPolicy::from_config(&cfg().allow_cap_grant_signing())
             .expect("the opt-in is the one way to reach the cap-grant path");
-        assert!(matches!(signing, Signing::CapGrant));
         assert_eq!(signing.label(), "client");
     }
 
@@ -644,7 +944,8 @@ mod tests {
         let cfg = cfg()
             .with_lair_signing(LAIR_URL, b"deadbeef".to_vec())
             .expect("lair signing from an explicit URL");
-        let signing = Signing::resolve(&cfg).expect("lair commits nothing, so it needs no opt-in");
+        let signing =
+            SigningPolicy::from_config(&cfg).expect("lair commits nothing, so it needs no opt-in");
         assert_eq!(signing.label(), "lair");
     }
 
@@ -654,12 +955,519 @@ mod tests {
             .with_lair_signing(LAIR_URL, b"deadbeef".to_vec())
             .expect("lair signing from an explicit URL")
             .allow_cap_grant_signing();
-        let signing = Signing::resolve(&cfg).expect("lair signing stays available");
+        let signing = SigningPolicy::from_config(&cfg).expect("lair signing stays available");
         assert_eq!(
             signing.label(),
             "lair",
             "the opt-in permits the chain write, it does not ask for one"
         );
+    }
+
+    #[test]
+    fn supplied_values_reach_the_lair_signer() {
+        let cfg = cfg()
+            .with_signing(
+                values(Some(LAIR_URL), Some("pass")),
+                CapGrantOptIn::Withheld,
+            )
+            .expect("both halves of the credentials configure lair signing");
+        // The URL itself, not just "some lair": the keystore it reaches is the
+        // one whose key the cell is signed with.
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            LAIR_URL
+        );
+        assert!(
+            !cfg.allow_cap_grant_signing,
+            "supplying credentials is not permission to write to the chain"
+        );
+    }
+
+    #[test]
+    fn a_nodes_paths_reach_the_lair_signer() {
+        let dir = node_with_lair();
+        let cfg = cfg()
+            .with_signing(node(&dir, "conductor-config.yaml"), CapGrantOptIn::Withheld)
+            .expect("a node with an external lair_server configures lair signing");
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            LAIR_URL
+        );
+        assert!(!cfg.allow_cap_grant_signing);
+    }
+
+    #[test]
+    fn half_the_values_is_not_a_signing_path() {
+        for (connection_url, passphrase, expected) in [
+            (Some(LAIR_URL), None, "connection URL is set"),
+            (None, Some("pass"), "passphrase is set"),
+        ] {
+            let err = format!(
+                "{:#}",
+                SigningPolicy::resolve(values(connection_url, passphrase), CapGrantOptIn::Withheld)
+                    .expect_err("half the credentials cannot sign anything")
+            );
+            assert!(err.contains("lair signing is required"), "{err}");
+            // Which half is missing, so a caller naming its own two variables
+            // does not send an operator looking at both.
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn no_credentials_and_no_opt_in_refuses() {
+        for lair in [LairCredentials::Absent, values(None, None)] {
+            let err = SigningPolicy::resolve(lair, CapGrantOptIn::Withheld)
+                .expect_err("nothing offered and nothing permitted must refuse");
+            assert!(crate::errors::is_signing_refusal(&err), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_lair_url_is_fatal_at_resolve_not_at_connect() {
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                values(Some("not a url"), Some("pass")),
+                CapGrantOptIn::Withheld
+            )
+            .expect_err("an unusable URL must not be left for the connection to discover")
+        );
+        assert!(err.contains("not a url"), "{err}");
+    }
+
+    #[test]
+    fn the_opt_in_reads_only_explicit_answers() {
+        for raw in ["1", "true", "YES", "On", " 1 ", "\ttrue\n"] {
+            assert_eq!(
+                CapGrantOptIn::from_value(Some(raw)).expect("an affirmative"),
+                CapGrantOptIn::Permitted,
+                "{raw}"
+            );
+        }
+        for raw in ["0", "false", "no", "OFF", ""] {
+            assert_eq!(
+                CapGrantOptIn::from_value(Some(raw)).expect("a negative"),
+                CapGrantOptIn::Withheld,
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            CapGrantOptIn::from_value(None).expect("an absent value"),
+            CapGrantOptIn::Withheld
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_opt_in_value_is_an_error_not_a_guess() {
+        let err = CapGrantOptIn::from_value(Some("maybe"))
+            .expect_err("the value permits a chain write, so it is never inferred")
+            .to_string();
+        assert!(err.contains("maybe"), "{err}");
+    }
+
+    #[test]
+    fn the_flag_form_of_the_opt_in_matches_the_value_form() {
+        assert_eq!(CapGrantOptIn::from_flag(true), CapGrantOptIn::Permitted);
+        assert_eq!(CapGrantOptIn::from_flag(false), CapGrantOptIn::Withheld);
+    }
+
+    #[test]
+    fn the_permitted_opt_in_still_prefers_lair() {
+        let dir = node_with_lair();
+        let cfg = cfg()
+            .with_signing(
+                node(&dir, "conductor-config.yaml"),
+                CapGrantOptIn::Permitted,
+            )
+            .expect("lair signing stays available");
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            LAIR_URL,
+            "the opt-in permits the chain write, it does not ask for one"
+        );
+        assert!(
+            !cfg.allow_cap_grant_signing,
+            "a config the policy wrote must carry the decision, not the permission"
+        );
+    }
+
+    #[test]
+    fn applying_a_policy_overwrites_whatever_the_config_was_carrying() {
+        let dir = node_with_lair();
+        // Onto a config that already permitted the chain write: the decision
+        // replaces both fields, so a config can never report a permission the
+        // policy did not grant or a signer it did not choose.
+        let decided = SigningPolicy::resolve(
+            node(&dir, "conductor-config.yaml"),
+            CapGrantOptIn::Permitted,
+        )
+        .expect("a node with lair resolves to lair")
+        .apply(cfg().allow_cap_grant_signing());
+        assert!(decided.lair.is_some());
+        assert!(!decided.allow_cap_grant_signing);
+
+        // And the other way: a cap-grant decision clears a lair signer the
+        // config was carrying.
+        let decided = SigningPolicy::resolve(LairCredentials::Absent, CapGrantOptIn::Permitted)
+            .expect("the opt-in permits the fallback")
+            .apply(
+                cfg()
+                    .with_lair_signing(LAIR_URL, b"deadbeef".to_vec())
+                    .expect("lair signing from an explicit URL"),
+            );
+        assert!(decided.lair.is_none());
+        assert!(decided.allow_cap_grant_signing);
+    }
+
+    #[test]
+    fn the_permitted_opt_in_is_the_fallback_when_lair_is_unavailable() {
+        // Neither file, which is the whole of the absence: a node carrying a
+        // passphrase is provisioned, and covered by its own test.
+        let dir = node_with_nothing();
+        let cfg = cfg()
+            .with_signing(
+                node(&dir, "absent-conductor-config.yaml"),
+                CapGrantOptIn::Permitted,
+            )
+            .expect("the caller permitted the cap-grant path for exactly this case");
+        assert!(cfg.lair.is_none());
+        assert!(cfg.allow_cap_grant_signing);
+    }
+
+    #[test]
+    fn a_failed_discovery_without_the_opt_in_never_reaches_the_chain_writing_path() {
+        // Both answers a node can fail with, because without the opt-in neither
+        // may fall back: no lair on the node at all, and a passphrase whose
+        // conductor config is not where the caller said.
+        for dir in [node_with_nothing(), node_with_lair()] {
+            let err = format!(
+                "{:#}",
+                cfg()
+                    .with_signing(
+                        node(&dir, "absent-conductor-config.yaml"),
+                        CapGrantOptIn::Withheld,
+                    )
+                    .expect_err("a node that cannot offer lair has no signing path left")
+            );
+            assert!(err.contains("lair signing is required"), "{err}");
+            assert!(err.contains("absent-conductor-config.yaml"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_policy_decides_the_same_way_again_through_the_config_it_wrote() {
+        let dir = node_with_lair();
+        let bare = node_with_nothing();
+        for (lair, opt_in) in [
+            (node(&dir, "conductor-config.yaml"), CapGrantOptIn::Withheld),
+            (
+                node(&dir, "conductor-config.yaml"),
+                CapGrantOptIn::Permitted,
+            ),
+            (
+                node(&bare, "absent-conductor-config.yaml"),
+                CapGrantOptIn::Permitted,
+            ),
+        ] {
+            let policy = SigningPolicy::resolve(lair, opt_in).expect("a decidable policy");
+            let again = SigningPolicy::from_config(&policy.apply(cfg()))
+                .expect("a config the policy wrote is never refused");
+            assert_eq!(policy.label(), again.label(), "{opt_in:?}");
+        }
+    }
+
+    #[test]
+    fn the_debug_of_supplied_credentials_never_renders_the_passphrase() {
+        let rendered = format!("{:?}", values(Some(LAIR_URL), Some("s3cr3t")));
+        assert!(!rendered.contains("s3cr3t"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    #[test]
+    fn the_debug_of_a_resolved_signer_never_renders_the_passphrase() {
+        // The form that outlives `resolve`: every consumer holds it inside a
+        // `HamConfig`, and some hold the policy too, so both are one `{:?}`
+        // away from a log line.
+        let policy = SigningPolicy::resolve(
+            values(Some(LAIR_URL), Some("s3cr3t")),
+            CapGrantOptIn::Withheld,
+        )
+        .expect("both halves configure lair signing");
+        for rendered in [format!("{policy:?}"), format!("{:?}", policy.apply(cfg()))] {
+            assert!(!rendered.contains("s3cr3t"), "{rendered}");
+            assert!(rendered.contains("redacted"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_credential_that_cannot_be_used_is_fatal_even_where_the_opt_in_is_granted() {
+        // The opt-in covers "this node has no lair to reach". It does not cover
+        // a typo: falling back on one would commit a capability grant to the
+        // agent's chain because a character was wrong.
+        for (connection_url, passphrase) in [
+            (Some("not a url"), Some("pass")),
+            (Some(LAIR_URL), None),
+            (None, Some("pass")),
+        ] {
+            let err = format!(
+                "{:#}",
+                SigningPolicy::resolve(
+                    values(connection_url, passphrase),
+                    CapGrantOptIn::Permitted,
+                )
+                .expect_err("a supplied credential that cannot be used is never a chain write")
+            );
+            assert!(err.contains("lair signing is required"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_nodes_malformed_lair_url_is_fatal_even_where_the_opt_in_is_granted() {
+        // The lair is there, so falling back would commit a capability grant
+        // to the agent's chain over one wrong character.
+        let dir = node_with_lair();
+        write_conductor_config(
+            &dir,
+            "typo.yaml",
+            "keystore:\n  type: lair_server\n  connection_url: unix//lair?k=abc\n",
+        );
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(node(&dir, "typo.yaml"), CapGrantOptIn::Permitted)
+                .expect_err("a lair_server URL that will not parse is a typo, not an absent lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("unix//lair?k=abc"), "{err}");
+        assert!(err.contains("typo.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_nodes_missing_passphrase_file_is_fatal_even_where_the_opt_in_is_granted() {
+        let dir = node_with_lair();
+        std::fs::remove_file(dir.path().join("lair-passphrase")).expect("remove the passphrase");
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                node(&dir, "conductor-config.yaml"),
+                CapGrantOptIn::Permitted
+            )
+            .expect_err("a passphrase file that cannot be read is not an absent lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("lair-passphrase"), "{err}");
+        // Which config made a missing passphrase fatal, rather than the
+        // fallback the caller asked for with `Permitted`.
+        assert!(err.contains("conductor-config.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_typod_config_path_beside_a_passphrase_is_fatal_even_where_the_opt_in_is_granted() {
+        // The passphrase is there, so this node was provisioned with a lair and
+        // the config path is what is wrong. Falling back would commit a
+        // capability grant to a node whose lair is sitting right beside it.
+        let dir = node_with_lair();
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                node(&dir, "conductor-cofnig.yaml"),
+                CapGrantOptIn::Permitted
+            )
+            .expect_err("a passphrase beside a missing config is a typo, not an absent lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        // Both paths, because the operator has to see which two disagreed.
+        assert!(err.contains("conductor-cofnig.yaml"), "{err}");
+        assert!(err.contains("lair-passphrase"), "{err}");
+    }
+
+    #[test]
+    fn a_passphrase_path_that_will_not_stat_is_not_an_absent_one() {
+        // Absent is `NotFound` and nothing else, so a passphrase path we cannot
+        // ask about is never read as a node without lair. Nested under a file,
+        // which stats as `NotADirectory`: no chmod, and true as root.
+        let dir = node_with_lair();
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                LairCredentials::Node {
+                    conductor_config: dir.path().join("absent-conductor-config.yaml"),
+                    passphrase_file: dir.path().join("lair-passphrase").join("nested"),
+                },
+                CapGrantOptIn::Permitted,
+            )
+            .expect_err("a path we cannot call absent is not an absence")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+    }
+
+    #[test]
+    fn a_conductor_config_that_cannot_be_read_is_not_an_absent_one() {
+        // A directory stands in for the unreadable file: no chmod, and it
+        // stays unreadable when the tests run as root.
+        let dir = node_with_lair();
+        std::fs::create_dir(dir.path().join("a-directory.yaml")).expect("create the directory");
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(node(&dir, "a-directory.yaml"), CapGrantOptIn::Permitted)
+                .expect_err("an unreadable conductor config is not a node without lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("a-directory.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_half_written_conductor_config_is_not_an_absent_lair() {
+        // A config that exists and says nothing usable is not a config saying
+        // "no lair here": a hand edit that truncates in place leaves one.
+        let dir = node_with_lair();
+        for (name, body) in [("empty.yaml", ""), ("half-written.yaml", "keystore:\n")] {
+            write_conductor_config(&dir, name, body);
+            let err = format!(
+                "{:#}",
+                SigningPolicy::resolve(node(&dir, name), CapGrantOptIn::Permitted)
+                    .expect_err("a config that cannot be read is not a config that says no")
+            );
+            assert!(err.contains("lair signing is required"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_node_with_no_external_lair_still_reaches_the_opt_ins_fallback() {
+        // The case the opt-in exists for: a conductor whose keystore exposes
+        // no socket to attach to, such as the sandbox unyt_cli is pointed at.
+        let dir = node_with_lair();
+        for (name, body) in [
+            ("in-proc.yaml", "keystore:\n  type: lair_server_in_proc\n"),
+            (
+                "in-proc-rooted.yaml",
+                "keystore:\n  type: lair_server_in_proc\n  lair_root: /x/ks\n",
+            ),
+            ("danger.yaml", "keystore:\n  type: danger_test_keystore\n"),
+            // `ConductorConfig::keystore` is `#[serde(default)]`, so a config
+            // that omits the section runs the in-process keystore: a conductor
+            // with no socket to attach to, not a file to refuse.
+            (
+                "no-keystore.yaml",
+                "data_root_path: /var/lib/holochain/data\n",
+            ),
+            ("empty-mapping.yaml", "{}\n"),
+        ] {
+            write_conductor_config(&dir, name, body);
+            let cfg = cfg()
+                .with_signing(node(&dir, name), CapGrantOptIn::Permitted)
+                .unwrap_or_else(|e| panic!("{name}: no external lair is an absence: {e:#}"));
+            assert!(cfg.lair.is_none(), "{name}");
+            assert!(cfg.allow_cap_grant_signing, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_fleet_conductor_config_signs_through_lair() {
+        // The config heart renders onto every fleet node, whole, because the
+        // whole document is read: if a Holochain upgrade moves a key the fleet
+        // writes, every node refuses to sign, and this is where that has to
+        // fail instead.
+        let dir = node_with_lair();
+        write_conductor_config(
+            &dir,
+            "fleet.yaml",
+            &format!(
+                "---\n\
+                 tracing_override: ~\n\
+                 data_root_path: \"/var/lib/holochain/data\"\n\
+                 keystore:\n  \
+                 type: lair_server\n  \
+                 connection_url: {LAIR_URL}\n\
+                 admin_interfaces:\n  \
+                 - driver:\n      \
+                 type: websocket\n      \
+                 port: 8800\n      \
+                 danger_bind_addr: ~\n      \
+                 allowed_origins: \"*\"\n\
+                 network:\n  \
+                 base64_auth_material_bootstrap: ~\n  \
+                 base64_auth_material_relay: ~\n  \
+                 bootstrap_url: \"https://bootstrap.unyt.example\"\n  \
+                 relay_url: \"wss://relay.unyt.example\"\n  \
+                 target_arc_factor: 1\n  \
+                 advanced: null\n  \
+                 request_timeout_s: 60\n\
+                 tuning_params: null\n\
+                 tracing_scope: null\n"
+            ),
+        );
+        let cfg = cfg()
+            .with_signing(node(&dir, "fleet.yaml"), CapGrantOptIn::Withheld)
+            .expect("the fleet's own conductor config must reach lair signing");
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            LAIR_URL
+        );
+    }
+
+    #[test]
+    fn a_config_the_conductor_would_reject_is_fatal_even_where_the_opt_in_is_granted() {
+        // `KeystoreConfig` names three keystores, and `ConductorConfig` takes
+        // no key it does not define, so each of these is a config no conductor
+        // is running. The near misses are what an operator actually types.
+        let dir = node_with_lair();
+        for (name, body, needle) in [
+            (
+                "misspelt-type.yaml",
+                format!("keystore:\n  type: lair_sever\n  connection_url: {LAIR_URL}\n"),
+                "lair_sever",
+            ),
+            (
+                "wrong-case-type.yaml",
+                format!("keystore:\n  type: LairServer\n  connection_url: {LAIR_URL}\n"),
+                "LairServer",
+            ),
+            (
+                "in-proc-with-a-url.yaml",
+                format!("keystore:\n  type: lair_server_in_proc\n  connection_url: {LAIR_URL}\n"),
+                "connection_url",
+            ),
+            // Broken outside the keystore, so only reading the whole document
+            // catches it.
+            (
+                "unknown-top-level-key.yaml",
+                "keystore:\n  type: lair_server_in_proc\nbogus_top_level: 1\n".to_string(),
+                "bogus_top_level",
+            ),
+        ] {
+            write_conductor_config(&dir, name, &body);
+            let err = format!(
+                "{:#}",
+                SigningPolicy::resolve(node(&dir, name), CapGrantOptIn::Permitted)
+                    .expect_err("a keystore the conductor would reject is not an absent lair")
+            );
+            assert!(err.contains("lair signing is required"), "{name}: {err}");
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_conductor_config_is_fatal_even_where_the_opt_in_is_granted() {
+        // The conductor config path pointed at lair's own config, its sibling
+        // in the same directory. `ConductorConfig` defines none of its keys, so
+        // it is a file no conductor was started from.
+        let dir = node_with_lair();
+        write_conductor_config(
+            &dir,
+            "lair-keystore-config.yaml",
+            "connectionUrl: unix:///x?k=y\npidFile: /x/pid\nstoreFile: /x/store\n",
+        );
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                node(&dir, "lair-keystore-config.yaml"),
+                CapGrantOptIn::Permitted
+            )
+            .expect_err("a file that is not a conductor config cannot say a node has no lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("lair-keystore-config.yaml"), "{err}");
     }
 
     #[tokio::test]
@@ -673,6 +1481,7 @@ mod tests {
         );
         let err = format!("{err:#}");
         assert!(err.contains("refusing to connect"), "{err}");
+        assert!(err.contains("unyt"), "the refusal must name the app: {err}");
         assert!(
             !err.contains("Failed to connect to admin interface"),
             "the refusal must land before any socket is opened: {err}"
@@ -701,96 +1510,91 @@ mod tests {
         );
     }
 
-    #[test]
-    fn with_lair_signing_from_node_reads_the_node() {
-        let dir = node_with_lair();
-        let cfg = cfg()
-            .with_lair_signing_from_node(
-                &dir.path().join("conductor-config.yaml"),
-                &dir.path().join("lair-passphrase"),
-            )
-            .expect("a node with an external lair_server configures lair signing");
-        assert_eq!(
-            cfg.lair
-                .as_ref()
-                .expect("lair signing")
-                .connection_url
-                .as_str(),
-            LAIR_URL
-        );
-        assert!(
-            !cfg.allow_cap_grant_signing,
-            "reading a node's lair is not permission to write to its chain"
-        );
+    /// The reason a config gives for naming no external lair, for the tests
+    /// that assert it answered rather than failed to answer.
+    fn no_external_lair(config_text: &str) -> String {
+        match parse_keystore(config_text).expect("a config that answers") {
+            NodeKeystore::NoExternalLair(why) => format!("{why:#}"),
+            NodeKeystore::LairServer(url) => panic!("expected no external lair, got {url}"),
+        }
     }
 
     #[test]
-    fn with_lair_signing_from_node_fails_loudly() {
-        let dir = node_with_lair();
-        let missing = dir.path().join("absent-conductor-config.yaml");
-        let err = cfg()
-            .with_lair_signing_from_node(&missing, &dir.path().join("lair-passphrase"))
-            .expect_err("a node without a conductor config cannot offer lair")
-            .to_string();
-        assert!(err.contains("absent-conductor-config.yaml"), "{err}");
-    }
-
-    #[test]
-    fn try_lair_signing_from_node_leaves_the_config_refusing() {
-        let dir = node_with_lair();
-        let cfg = cfg().try_lair_signing_from_node(
-            &dir.path().join("absent-conductor-config.yaml"),
-            &dir.path().join("lair-passphrase"),
-        );
-        assert!(cfg.lair.is_none());
-        assert!(
-            Signing::resolve(&cfg).is_err(),
-            "a failed discovery must not leave the caller on the chain-writing path"
-        );
-    }
-
-    #[test]
-    fn parse_connection_url_reads_lair_server_url() {
+    fn parse_keystore_reads_a_lair_server_url() {
         let cfg = "\
 keystore:
   type: lair_server
   connection_url: unix:///var/lib/holochain/lair/socket?k=abc123
 data_root_path: /var/lib/holochain/data
 ";
-        let url = parse_connection_url(cfg).expect("should parse a lair_server connection_url");
+        let NodeKeystore::LairServer(url) =
+            parse_keystore(cfg).expect("should parse a lair_server connection_url")
+        else {
+            panic!("an external lair_server is a lair to reach");
+        };
         assert_eq!(url.scheme(), "unix");
         assert!(url.as_str().contains("k=abc123"), "got {}", url.as_str());
     }
 
     #[test]
-    fn parse_connection_url_rejects_non_lair_server() {
-        // Carries a connection_url, so the only thing that can reject it is the
-        // type check itself.
+    fn parse_keystore_reads_a_non_lair_server_as_no_external_lair() {
+        // Carries a connection_url, so the only thing that can classify it is
+        // the type check itself.
         let cfg = "keystore:\n  type: danger_test_keystore\n  connection_url: unix:///x?k=y\n";
-        let err = parse_connection_url(cfg)
-            .expect_err("only an external lair_server exposes a connectable socket")
-            .to_string();
-        assert!(err.contains("danger_test_keystore"), "{err}");
+        let why = no_external_lair(cfg);
+        assert!(why.contains("danger_test_keystore"), "{why}");
     }
 
     #[test]
-    fn parse_connection_url_errors_without_url() {
-        let cfg = "keystore:\n  type: lair_server\n";
-        assert!(parse_connection_url(cfg).is_err());
+    fn parse_keystore_errors_when_a_lair_server_names_no_url() {
+        assert!(parse_keystore("keystore:\n  type: lair_server\n").is_err());
     }
 
     #[test]
-    fn parse_connection_url_errors_without_keystore() {
-        let cfg = "data_root_path: /var/lib/holochain/data\n";
-        assert!(parse_connection_url(cfg).is_err());
-    }
-
-    #[test]
-    fn parse_connection_url_errors_without_type() {
+    fn parse_keystore_errors_without_a_type() {
         // A keystore section carrying a connection_url but no `type` must be
-        // rejected, not assumed to be a lair_server.
-        let cfg = "keystore:\n  connection_url: unix:///x?k=y\n";
-        assert!(parse_connection_url(cfg).is_err());
+        // rejected, not assumed to be a lair_server and not read as an absence.
+        assert!(parse_keystore("keystore:\n  connection_url: unix:///x?k=y\n").is_err());
+    }
+
+    #[test]
+    fn parse_keystore_errors_on_what_is_not_a_conductor_config() {
+        for cfg in [
+            "",
+            "just a string\n",
+            "- one\n- two\n",
+            "connectionUrl: unix:///x?k=y\npidFile: /x/pid\n",
+        ] {
+            assert!(parse_keystore(cfg).is_err(), "{cfg:?}");
+        }
+    }
+
+    #[test]
+    fn parse_keystore_never_renders_what_it_rejects() {
+        // The conductor config path pointed at the passphrase file, in every
+        // shape one can take. serde renders the key or the value it rejects,
+        // and a hand-set passphrase carrying a colon parses as a mapping, so a
+        // file that names no keystore never reaches it. `reconnect` logs this
+        // at `error!` on every attempt, so one leak repeats into journald.
+        for cfg in [
+            // What we generate: a hex scalar, and not a mapping at all.
+            "deadbeefs3cr3t\n",
+            // Hand-set, with a colon, so the secret is a key.
+            "s3cr3t: x\n",
+            // A trailing colon makes the whole passphrase the key.
+            "s3cr3tpassword:\n",
+            // Or lands the secret in a value, at the top level and nested.
+            "keystore: s3cr3t\n",
+            "db_max_readers: s3cr3t\n",
+            "network:\n  bootstrap_url: s3cr3t\n",
+        ] {
+            let Err(e) = parse_keystore(cfg) else {
+                panic!("{cfg:?} is not a conductor config");
+            };
+            let err = format!("{e:#}");
+            assert!(!err.contains("s3cr3t"), "{err}");
+            assert!(!err.contains("password"), "{err}");
+        }
     }
 
     #[test]

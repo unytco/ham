@@ -10,12 +10,15 @@ watchtower).
   that handles admin-interface discovery, app-interface attach, zome-call
   signing, and typed msgpack zome calls with an explicit per-request timeout.
   Signs via lair as the cell's own agent key, committing no capability grant to
-  the chain (`HamConfig::with_lair_signing_from_node` / `with_lair_signing`).
-  The other path, authorizing a throwaway signing key by committing one cap
-  grant per connect, is reachable only through
-  `HamConfig::allow_cap_grant_signing()`: a config with neither is refused
-  before `Ham::connect` opens a socket, so connecting never writes to a chain
-  no caller asked it to write to.
+  the chain. The other path, authorizing a throwaway signing key by committing
+  one cap grant per connect, is reachable only by asking for it: a config with
+  neither is refused before `Ham::connect` opens a socket, so connecting never
+  writes to a chain no caller asked it to write to.
+- `HamConfig::with_signing(LairCredentials, CapGrantOptIn)`: the lair-or-refuse
+  decision, made here once, so a consumer supplies its inputs rather than
+  rebuilding it. `SigningPolicy::resolve` is the same decision without a config,
+  for a caller that decides at startup and connects later. See their rustdoc for
+  the rules.
 - `errors::is_connection_error(&anyhow::Error) -> bool` &mdash; string-based
   classifier that decides whether an error warrants rebuilding the socket
   (covered by unit tests). `errors::is_signing_refusal` is its opposite: a
@@ -30,8 +33,12 @@ watchtower).
 ## Usage
 
 ```rust
-use ham::{Ham, HamConfig, BackoffConfig, install_shutdown_handler, connect_with_backoff};
-use std::path::Path;
+use anyhow::Context;
+use ham::{
+    BackoffConfig, CapGrantOptIn, Ham, HamConfig, LairCredentials, connect_with_backoff,
+    install_shutdown_handler,
+};
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,10 +47,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = HamConfig::new(30000, 30001, "bridging-app")
         .with_request_timeout_secs(120)
-        .with_lair_signing_from_node(
-            Path::new("/etc/holochain/conductor-config.yaml"),
-            Path::new("/var/lib/holochain/lair-passphrase"),
-        )?;
+        .with_signing(
+            LairCredentials::Node {
+                conductor_config: PathBuf::from("/etc/holochain/conductor-config.yaml"),
+                passphrase_file: PathBuf::from("/var/lib/holochain/lair-passphrase"),
+            },
+            CapGrantOptIn::Withheld,
+        )
+        // Name your own variables or flags here. ham states the fault; the
+        // caller states which knob to turn.
+        .context("CONDUCTOR_CONFIG / LAIR_PASSPHRASE_FILE must name a node running an external lair_server")?;
 
     let mut ham = match connect_with_backoff(
         || Ham::connect(cfg.clone()),
@@ -92,9 +105,9 @@ deployment dashboards can alert on:
 | `ham.connecting` | `info` | `Ham::connect` is invoked and the signing path is settled. |
 | `ham.connected` | `info` | App websocket connected and signing set up; the `signing` field is `lair` (no cap grant) or `client` (cap grant committed). |
 | `ham.connect.refused` | `error` | A reconnect attempt failed because the config has no signing path that avoids writing to the chain. Logged from the first attempt: retrying cannot clear it. |
-| `ham.cap_grant_unused` | `warn` | The config permits a capability grant and has lair too, so lair was used and nothing was written. |
+| `ham.cap_grant_unused` | `info` | The caller permits a capability grant and has lair too, so lair was used and nothing was written. |
 | `ham.cap_grant` | `warn` | About to commit the capability grant `allow_cap_grant_signing` asked for. |
-| `ham.lair_discovery_failed` | `warn` | `try_lair_signing_from_node` could not resolve the URL/passphrase; the connect is refused unless the caller also opted in. |
+| `ham.lair_unavailable` | `warn` | There is no lair to reach, so the capability grant the caller permitted is taken instead. Credentials that were supplied but cannot be used are fatal and never reach this. |
 | `ham.call_zome` | `debug` | Per zome call. |
 | `ham.reconnect.attempt` | `warn` / `error` | Each failed reconnect attempt (`error` after `escalate_after`). |
 | `ham.reconnected` | `info` | Reconnect succeeded after one or more failed attempts. |
