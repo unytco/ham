@@ -170,13 +170,16 @@ pub enum LairCredentials {
         passphrase: Option<Vec<u8>>,
     },
     /// The conductor's own files, read when the policy resolves. A node naming
-    /// no external `lair_server`, or with no conductor config there at all, has
-    /// no lair to reach: the absence [`CapGrantOptIn::Permitted`] falls back
-    /// from. A config that names one and cannot be used is fatal either way, as
-    /// is a config this build cannot read: it is read with the
-    /// `ConductorConfig` ham is pinned to, so any key that schema does not
-    /// define, anywhere in the document and from a Holochain either side of the
-    /// pin, refuses rather than falls back.
+    /// no external `lair_server`, or with neither file on it, has no lair to
+    /// reach: the absence [`CapGrantOptIn::Permitted`] falls back from. A
+    /// passphrase with no conductor config beside it is a provisioned node and
+    /// a path to fix, not an absence.
+    ///
+    /// A config that names a lair and cannot be used is fatal either way, as is
+    /// a config this build cannot read: it is read with the `ConductorConfig`
+    /// ham is pinned to, so any key that schema does not define, anywhere in
+    /// the document and from a Holochain either side of the pin, refuses rather
+    /// than falls back.
     Node {
         /// Config whose `keystore.connection_url` names the keystore.
         conductor_config: PathBuf,
@@ -718,12 +721,30 @@ fn resolve_lair_from_node(conductor_config_path: &Path, passphrase_file: &Path) 
     };
     let config_text = match std::fs::read_to_string(conductor_config_path) {
         Ok(text) => text,
-        // A path nothing is at names no lair. A path something is at that will
-        // not read is a node we could not ask, which is not an answer of no.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Offered::NoLair(Some(named(anyhow::Error::new(e))))
+        // A path something is at that will not read is a node we could not ask,
+        // which is not an answer of no.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Offered::Unusable(named(anyhow::Error::new(e)))
         }
-        Err(e) => return Offered::Unusable(named(anyhow::Error::new(e))),
+        // Neither file is a node with no lair. A passphrase still sitting there
+        // is a node that was provisioned with one, so the config path is what
+        // is wrong, and falling back would write to the chain of a node whose
+        // lair is reachable. Only `NotFound` is absent: a path that will not
+        // stat is one we cannot call absent.
+        Err(e) => {
+            return match std::fs::metadata(passphrase_file).err().map(|m| m.kind()) {
+                Some(std::io::ErrorKind::NotFound) => {
+                    Offered::NoLair(Some(named(anyhow::Error::new(e))))
+                }
+                _ => Offered::Unusable(anyhow::anyhow!(
+                    "no conductor config at {} and a lair passphrase at {}: this node has lair \
+                     credentials and a config path that does not name them, so fix the path, or \
+                     remove the passphrase if the install it belongs to is gone",
+                    conductor_config_path.display(),
+                    passphrase_file.display()
+                )),
+            }
+        }
     };
     let connection_url = match parse_keystore(&config_text) {
         Ok(NodeKeystore::LairServer(url)) => url,
@@ -845,6 +866,12 @@ mod tests {
 
     fn write_conductor_config(dir: &tempfile::TempDir, name: &str, body: &str) {
         std::fs::write(dir.path().join(name), body).expect("write conductor config");
+    }
+
+    /// A node with neither file on it: the machine `unyt_cli` runs a local
+    /// sandbox on, pointed at the fleet's paths by default.
+    fn node_with_nothing() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
     }
 
     /// A port with nothing listening on it: bound to learn a free one, then
@@ -1082,7 +1109,9 @@ mod tests {
 
     #[test]
     fn the_permitted_opt_in_is_the_fallback_when_lair_is_unavailable() {
-        let dir = node_with_lair();
+        // Neither file, which is the whole of the absence: a node carrying a
+        // passphrase is provisioned, and covered by its own test.
+        let dir = node_with_nothing();
         let cfg = cfg()
             .with_signing(
                 node(&dir, "absent-conductor-config.yaml"),
@@ -1095,23 +1124,28 @@ mod tests {
 
     #[test]
     fn a_failed_discovery_without_the_opt_in_never_reaches_the_chain_writing_path() {
-        let dir = node_with_lair();
-        let err = format!(
-            "{:#}",
-            cfg()
-                .with_signing(
-                    node(&dir, "absent-conductor-config.yaml"),
-                    CapGrantOptIn::Withheld,
-                )
-                .expect_err("a node that cannot offer lair has no signing path left")
-        );
-        assert!(err.contains("lair signing is required"), "{err}");
-        assert!(err.contains("absent-conductor-config.yaml"), "{err}");
+        // Both answers a node can fail with, because without the opt-in neither
+        // may fall back: no lair on the node at all, and a passphrase whose
+        // conductor config is not where the caller said.
+        for dir in [node_with_nothing(), node_with_lair()] {
+            let err = format!(
+                "{:#}",
+                cfg()
+                    .with_signing(
+                        node(&dir, "absent-conductor-config.yaml"),
+                        CapGrantOptIn::Withheld,
+                    )
+                    .expect_err("a node that cannot offer lair has no signing path left")
+            );
+            assert!(err.contains("lair signing is required"), "{err}");
+            assert!(err.contains("absent-conductor-config.yaml"), "{err}");
+        }
     }
 
     #[test]
     fn a_policy_decides_the_same_way_again_through_the_config_it_wrote() {
         let dir = node_with_lair();
+        let bare = node_with_nothing();
         for (lair, opt_in) in [
             (node(&dir, "conductor-config.yaml"), CapGrantOptIn::Withheld),
             (
@@ -1119,7 +1153,7 @@ mod tests {
                 CapGrantOptIn::Permitted,
             ),
             (
-                node(&dir, "absent-conductor-config.yaml"),
+                node(&bare, "absent-conductor-config.yaml"),
                 CapGrantOptIn::Permitted,
             ),
         ] {
@@ -1212,6 +1246,46 @@ mod tests {
         // Which config made a missing passphrase fatal, rather than the
         // fallback the caller asked for with `Permitted`.
         assert!(err.contains("conductor-config.yaml"), "{err}");
+    }
+
+    #[test]
+    fn a_typod_config_path_beside_a_passphrase_is_fatal_even_where_the_opt_in_is_granted() {
+        // The passphrase is there, so this node was provisioned with a lair and
+        // the config path is what is wrong. Falling back would commit a
+        // capability grant to a node whose lair is sitting right beside it.
+        let dir = node_with_lair();
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                node(&dir, "conductor-cofnig.yaml"),
+                CapGrantOptIn::Permitted
+            )
+            .expect_err("a passphrase beside a missing config is a typo, not an absent lair")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
+        // Both paths, because the operator has to see which two disagreed.
+        assert!(err.contains("conductor-cofnig.yaml"), "{err}");
+        assert!(err.contains("lair-passphrase"), "{err}");
+    }
+
+    #[test]
+    fn a_passphrase_path_that_will_not_stat_is_not_an_absent_one() {
+        // Absent is `NotFound` and nothing else, so a passphrase path we cannot
+        // ask about is never read as a node without lair. Nested under a file,
+        // which stats as `NotADirectory`: no chmod, and true as root.
+        let dir = node_with_lair();
+        let err = format!(
+            "{:#}",
+            SigningPolicy::resolve(
+                LairCredentials::Node {
+                    conductor_config: dir.path().join("absent-conductor-config.yaml"),
+                    passphrase_file: dir.path().join("lair-passphrase").join("nested"),
+                },
+                CapGrantOptIn::Permitted,
+            )
+            .expect_err("a path we cannot call absent is not an absence")
+        );
+        assert!(err.contains("lair signing is required"), "{err}");
     }
 
     #[test]
