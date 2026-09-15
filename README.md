@@ -107,7 +107,7 @@ deployment dashboards can alert on:
 | `ham.connect.refused` | `error` | A reconnect attempt failed because the config has no signing path that avoids writing to the chain. Logged from the first attempt: retrying cannot clear it. |
 | `ham.cap_grant_unused` | `info` | The caller permits a capability grant and has lair too, so lair was used and nothing was written. |
 | `ham.cap_grant` | `warn` | About to commit the capability grant `allow_cap_grant_signing` asked for. |
-| `ham.lair_unavailable` | `warn` | The lair credentials could not be resolved, so the capability grant the caller permitted is taken instead. |
+| `ham.lair_unavailable` | `warn` | There is no lair to reach, so the capability grant the caller permitted is taken instead. Credentials that were supplied but cannot be used are fatal and never reach this. |
 | `ham.call_zome` | `debug` | Per zome call. |
 | `ham.reconnect.attempt` | `warn` / `error` | Each failed reconnect attempt (`error` after `escalate_after`). |
 | `ham.reconnected` | `info` | Reconnect succeeded after one or more failed attempts. |

@@ -169,10 +169,11 @@ pub enum LairCredentials {
         /// Passphrase bytes that unlock it.
         passphrase: Option<Vec<u8>>,
     },
-    /// The conductor's own files: the config whose `keystore.connection_url`
-    /// names the keystore, and the file holding the passphrase.
+    /// The conductor's own files, read when the policy resolves.
     Node {
+        /// Config whose `keystore.connection_url` names the keystore.
         conductor_config: PathBuf,
+        /// File holding the passphrase that unlocks it.
         passphrase_file: PathBuf,
     },
     /// The caller has no lair to offer. The same answer as `Values` with both
