@@ -785,10 +785,8 @@ fn parse_keystore(config_text: &str) -> Result<NodeKeystore> {
     use lair_keystore_api::dependencies::serde_yaml;
     let doc: serde_yaml::Value =
         serde_yaml::from_str(config_text).context("parsing conductor config YAML")?;
-    // serde renders the value it rejects, so no scalar reaches it: a passphrase
-    // file read as a conductor config by mistake is one, and hex carries no
-    // colon to parse as anything else. An unknown key or variant tag still
-    // renders, which is what names the wrong file when the paths are swapped.
+    // serde renders the key or the value it rejects, so a scalar stops here: a
+    // generated passphrase read as a conductor config by mistake is one.
     anyhow::ensure!(doc.is_mapping(), "is not a YAML mapping");
     anyhow::ensure!(
         doc.get("keystore")
@@ -797,8 +795,23 @@ fn parse_keystore(config_text: &str) -> Result<NodeKeystore> {
     );
     // Read with the `ConductorConfig` this build is pinned to, so a config a
     // newer Holochain wrote is refused rather than read loosely.
-    let config: ConductorConfig =
-        serde_yaml::from_value(doc).context("is not a conductor config ham can read")?;
+    let names_a_keystore = doc.get("keystore").is_some();
+    let config: ConductorConfig = serde_yaml::from_value(doc).map_err(|e| {
+        // A hand-set passphrase carrying a colon parses as a mapping, and serde
+        // would render its key, or everything after the colon as a value. A
+        // file naming no keystore is not a conductor config, so serde's text is
+        // dropped there rather than repeated into journald by the `error!` on
+        // every reconnect attempt. Kept where a keystore section is present:
+        // that file is a real config, and the field it got wrong is what an
+        // operator needs to fix it.
+        if names_a_keystore {
+            anyhow::Error::new(e).context("is not a conductor config ham can read")
+        } else {
+            anyhow::anyhow!(
+                "names no `keystore` section, and is not a conductor config ham can read"
+            )
+        }
+    })?;
     let kind = match config.keystore {
         KeystoreConfig::LairServer { connection_url } => {
             // Through the text rather than the type: `url2` declares its own
@@ -1558,15 +1571,29 @@ data_root_path: /var/lib/holochain/data
 
     #[test]
     fn parse_keystore_never_renders_what_it_rejects() {
-        // The conductor config path pointed at the passphrase file, whole and
-        // as somebody's `keystore`. serde renders the value it rejects, so the
-        // passphrase must stop before it.
-        for cfg in ["deadbeefs3cr3t\n", "keystore: s3cr3t\n"] {
+        // The conductor config path pointed at the passphrase file, in every
+        // shape one can take. serde renders the key or the value it rejects,
+        // and a hand-set passphrase carrying a colon parses as a mapping, so a
+        // file that names no keystore never reaches it. `reconnect` logs this
+        // at `error!` on every attempt, so one leak repeats into journald.
+        for cfg in [
+            // What we generate: a hex scalar, and not a mapping at all.
+            "deadbeefs3cr3t\n",
+            // Hand-set, with a colon, so the secret is a key.
+            "s3cr3t: x\n",
+            // A trailing colon makes the whole passphrase the key.
+            "s3cr3tpassword:\n",
+            // Or lands the secret in a value, at the top level and nested.
+            "keystore: s3cr3t\n",
+            "db_max_readers: s3cr3t\n",
+            "network:\n  bootstrap_url: s3cr3t\n",
+        ] {
             let Err(e) = parse_keystore(cfg) else {
                 panic!("{cfg:?} is not a conductor config");
             };
             let err = format!("{e:#}");
             assert!(!err.contains("s3cr3t"), "{err}");
+            assert!(!err.contains("password"), "{err}");
         }
     }
 
