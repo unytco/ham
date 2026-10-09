@@ -19,6 +19,12 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
     // case-sensitive on purpose: each matches one exact upstream `Display`
     // composition, where the case is part of what pins that composition.
     let msg = format!("{err:#}").to_lowercase();
+    // The conductor answered over the socket, so the socket is open, whatever
+    // the answer says: the conductor's own keystore or network failing reads
+    // like a transport failure of ours, and no rebuild of ours fixes it.
+    if msg.contains("external api wire error") {
+        return false;
+    }
     // IMPORTANT: do NOT use a bare `"websocket error"` needle here. That
     // phrase is emitted for both genuine transport failures AND for
     // per-request timeouts (`"Websocket error: Timeout"`), and the latter
@@ -576,6 +582,34 @@ mod tests {
             // socket is healthy; the conductor is under pressure.
             assert!(!is_connection_error(&e), "got {e:#}");
             assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn a_conductor_answer_naming_a_transport_failure_is_not_a_connection_failure() {
+            for (wire, expected) in [
+                // The conductor's own lair connection failing under a host fn.
+                (
+                    ExternalApiWireError::RibosomeError(
+                        r#"KeystoreError: {"error":"BrokenPipe"}"#.to_string(),
+                    ),
+                    r#"External API wire error: RibosomeError("KeystoreError: {\"error\":\"BrokenPipe\"}")"#,
+                ),
+                (
+                    ExternalApiWireError::RibosomeError(
+                        r#"KeystoreError: {"error":"ConnectionAborted"}"#.to_string(),
+                    ),
+                    r#"External API wire error: RibosomeError("KeystoreError: {\"error\":\"ConnectionAborted\"}")"#,
+                ),
+                (
+                    ExternalApiWireError::InternalError(
+                        "IO error: connection reset by peer".to_string(),
+                    ),
+                    r#"External API wire error: InternalError("IO error: connection reset by peer")"#,
+                ),
+            ] {
+                let e = rendering(ConductorApiError::ExternalApiWireError(wire), expected);
+                assert!(!is_connection_error(&e), "got {e:#}");
+            }
         }
 
         mod lair {
