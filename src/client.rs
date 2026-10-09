@@ -451,17 +451,30 @@ pub struct Ham {
 /// its own: its receive task keeps the socket open until lair closes it, and
 /// lair never does, so each dropped `Ham` would leave one open in both
 /// processes.
-struct LairConnection(Arc<LairClient>);
+struct LairConnection {
+    client: Arc<LairClient>,
+    /// The runtime the client's receive task runs on, which the `Ham` holding
+    /// this may be dropped outside of.
+    runtime: tokio::runtime::Handle,
+}
+
+impl LairConnection {
+    fn new(client: Arc<LairClient>) -> Self {
+        Self {
+            client,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
 
 impl Drop for LairConnection {
     fn drop(&mut self) {
-        // With no runtime left, the task holding the socket is gone too.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let shutdown = self.0.shutdown();
-            runtime.spawn(async move {
-                let _ = shutdown.await;
-            });
-        }
+        // A runtime that has shut down drops this task unrun, and has already
+        // closed the socket along with the receive task it owned.
+        let shutdown = self.client.shutdown();
+        self.runtime.spawn(async move {
+            let _ = shutdown.await;
+        });
     }
 }
 
@@ -568,7 +581,7 @@ impl Ham {
                                 lair.passphrase.clone(),
                             )
                             .await
-                            .map(|client| LairConnection(Arc::new(client)))
+                            .map(|client| LairConnection::new(Arc::new(client)))
                             .map_err(|e| {
                                 anyhow::anyhow!(
                                     "Failed to connect to lair keystore at {}: {}",
@@ -582,7 +595,7 @@ impl Ham {
                     // current (single-role) consumer calls. A multi-role app
                     // signing a non-primary role would need per-cell registration
                     // here.
-                    let mut signer = LairAgentSigner::new(lair_client.0.clone());
+                    let mut signer = LairAgentSigner::new(lair_client.client.clone());
                     signer.add_credentials(cell_id.clone(), cell_id.agent_pubkey().clone());
                     (Arc::new(signer), Pending::Lair(cell_id), Some(lair_client))
                 }
@@ -888,11 +901,52 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_lair_connection_is_closed_on_lairs_side_too() {
         let lair = Lair::start().await;
-        drop(LairConnection(lair.client.clone()));
+        drop(LairConnection::new(lair.client.clone()));
 
         tokio::time::timeout(Duration::from_secs(5), lair.closed_by_lair.notified())
             .await
             .expect("lair closes the connection once its client shuts its side");
+    }
+
+    /// A lair connection opened on its own runtime, handed back out of it.
+    fn connected_on(runtime: &tokio::runtime::Runtime) -> (Lair, LairConnection) {
+        runtime.block_on(async {
+            let lair = Lair::start().await;
+            let connection = LairConnection::new(lair.client.clone());
+            (lair, connection)
+        })
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_lair_connection_dropped_outside_its_runtime_is_closed_on_lairs_side_too() {
+        let runtime = current_thread_runtime();
+        let (lair, connection) = connected_on(&runtime);
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(connection);
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), lair.closed_by_lair.notified())
+                .await
+                .expect("the runtime that is still alive shuts the client's side down");
+        });
+    }
+
+    #[test]
+    fn a_lair_connection_dropped_after_its_runtime_shut_down_is_quiet() {
+        let runtime = current_thread_runtime();
+        let (lair, connection) = connected_on(&runtime);
+
+        drop(runtime);
+        drop(connection);
+        drop(lair);
     }
 
     #[tokio::test]
