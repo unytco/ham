@@ -25,6 +25,9 @@ pub mod errors;
 pub mod reconnect;
 pub mod shutdown;
 
+#[cfg(test)]
+mod lair_fixture;
+
 pub use client::{
     CapGrantOptIn, Ham, HamConfig, LairCredentials, LairSigning, SigningPolicy, SigningRefused,
 };

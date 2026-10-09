@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Ham::connect` refuses a config that has neither lair signing nor `HamConfig::allow_cap_grant_signing()`, so connecting never commits a capability grant nobody asked for. A node that cannot offer lair reports why instead of falling back to that write, and `is_signing_refusal` tells a reconnect loop that a refusal is a config to fix rather than a conductor to wait for.
 - `is_connection_error` now classifies the send-path `tungstenite` close variants (`SendAfterClosing`, `AlreadyClosed`, `ConnectionClosed`, `ResetWithoutClosingHandshake`) — a send-side close reconnects instead of retrying a dead socket. Matching is case-insensitive.
 - `is_connection_error` classifies `ResponderDropped` as a connection error.
+- `is_connection_error` classifies a call that fails at signing because lair went away (`BrokenPipe`, `ConnectionAborted`) as a connection error, so a lair restart reconnects instead of failing every call until the process restarts.
 - Pin the error classifiers against real upstream error values.
 - upgrade holochain_client to `=0.9.0` (and lair_keystore_api to 0.7.1) for Holochain 0.7 — breaking for consumers, who must bump in lockstep.
 - upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0

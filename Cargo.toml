@@ -43,3 +43,7 @@ holochain_websocket = "0.7.0"
 tungstenite = "0.27"
 # Temp conductor-config / passphrase fixtures for the lair-discovery tests.
 tempfile = "3"
+# A unix socket between a real lair client and server that a test can cut.
+tokio = { version = "1", features = ["net", "io-util"] }
+# The `DnaHash` a test `CellId` needs, which `holochain_client` does not re-export.
+holo_hash = "0.7"
