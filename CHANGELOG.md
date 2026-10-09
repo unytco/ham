@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `is_connection_error` classifies `ResponderDropped` as a connection error.
 - `is_connection_error` classifies a call that fails at signing because lair went away (`BrokenPipe`, `ConnectionAborted`) as a connection error, so a lair restart reconnects instead of failing every call until the process restarts.
 - `is_connection_error` never counts an error the conductor answered with (`External API wire error`), whatever it names: the socket that carried it is open.
+- A dropped `Ham` closes its lair connection, so each reconnect no longer leaves one open in the process and in lair.
 - Pin the error classifiers against real upstream error values.
 - upgrade holochain_client to `=0.9.0` (and lair_keystore_api to 0.7.1) for Holochain 0.7 — breaking for consumers, who must bump in lockstep.
 - upgrade holochain_client to 0.8.2-rc.0 for Holochain 0.6.2-rc.0

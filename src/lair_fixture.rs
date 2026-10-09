@@ -18,6 +18,8 @@ pub(crate) struct Lair {
     pub key: Ed25519PubKey,
     /// Stops forwarding requests to lair; replies still come back.
     pub stall_requests: Arc<Notify>,
+    /// Notified once lair has closed the client's connection.
+    pub closed_by_lair: Arc<Notify>,
     forwarding: [JoinHandle<()>; 2],
     _server: IpcKeystoreServer,
     _dir: tempfile::TempDir,
@@ -45,7 +47,8 @@ impl Lair {
         cut_url.set_path(cut_path.to_str().unwrap());
         let lair_path = server.get_config().get_connection_path();
         let stall_requests = Arc::new(Notify::new());
-        let stall = stall_requests.clone();
+        let closed_by_lair = Arc::new(Notify::new());
+        let (stall, closed) = (stall_requests.clone(), closed_by_lair.clone());
         let (forwarding_tx, forwarding_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (client, _) = listener.accept().await.unwrap();
@@ -56,13 +59,17 @@ impl Lair {
             // either socket.
             let requests = tokio::spawn(async move {
                 tokio::select! {
-                    _ = tokio::io::copy(&mut from_client, &mut to_lair) => {}
+                    _ = tokio::io::copy(&mut from_client, &mut to_lair) => {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = to_lair.shutdown().await;
+                    }
                     _ = stall.notified() => {}
                 }
                 std::future::pending::<()>().await
             });
             let replies = tokio::spawn(async move {
                 let _ = tokio::io::copy(&mut from_lair, &mut to_client).await;
+                closed.notify_one();
                 std::future::pending::<()>().await
             });
             let _ = forwarding_tx.send([requests, replies]);
@@ -78,6 +85,7 @@ impl Lair {
             client: Arc::new(client),
             key,
             stall_requests,
+            closed_by_lair,
             forwarding: forwarding_rx.await.unwrap(),
             _server: server,
             _dir: dir,
