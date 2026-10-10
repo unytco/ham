@@ -1,6 +1,6 @@
 [package]
 name = "ham"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Production-grade Holochain AppWebsocket wrapper with reconnect, shutdown, and error-classification helpers"
 license = "MIT OR Apache-2.0"
@@ -17,29 +17,16 @@ rmp-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "signal", "sync", "time", "rt"] }
 tracing = "0.1"
-# The conductor's own `KeystoreConfig`, so a node's keystore is classified
-# exactly as the conductor loading that config classifies it, and its
-# `ExternalApiWireError`, which `errors::is_source_chain_pressure` keys on.
-# `holochain_client 0.9.0` already resolves this version transitively, so this
-# costs no extra crate to build; the ranges must stay aligned, because if they
-# diverge Cargo builds two distinct copies of these types and the crate stops
-# compiling. Fix that by realigning the range, never by loosening it. A caret
-# where its sibling is an exact pin, deliberately: inside one Holochain line a
-# field added upstream can only turn a config ham refuses into one it accepts,
-# so a conductor patched within its line keeps signing without a ham release.
+# Must resolve to the version holochain_client uses, or Cargo builds two copies
+# of its types and ham stops compiling. A caret on purpose: a patch within 0.7
+# can only widen what ham accepts.
 holochain_conductor_api = "0.7.0"
 
 [dev-dependencies]
-# Lets the classifier tests build *real* upstream error values instead of
-# hand-written strings; `holochain_client` doesn't re-export `WebsocketError`,
-# so there's no other way to construct one. Must stay on the version
-# `holochain_client` resolves — if the two ranges ever diverge, Cargo builds
-# two distinct `WebsocketError` types and this module stops compiling. Fix that
-# by realigning the range, never by loosening it.
+# The first three must match the versions holochain_client resolves, for the
+# same reason as holochain_conductor_api.
 holochain_websocket = "0.7.0"
-# Post-handshake the socket is tungstenite's, so its io and protocol errors
-# reach us wrapped as `WebsocketError::Websocket(_)`. Same unification rule as
-# above — must match what `holochain_websocket` pulls in via tokio-tungstenite.
 tungstenite = "0.27"
-# Temp conductor-config / passphrase fixtures for the lair-discovery tests.
+holo_hash = "0.7"
 tempfile = "3"
+tokio = { version = "1", features = ["net", "io-util"] }

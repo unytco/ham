@@ -19,6 +19,12 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
     // case-sensitive on purpose: each matches one exact upstream `Display`
     // composition, where the case is part of what pins that composition.
     let msg = format!("{err:#}").to_lowercase();
+    // The conductor answered over the socket, so the socket is open, whatever
+    // the answer says: the conductor's own keystore or network failing reads
+    // like a transport failure of ours, and no rebuild of ours fixes it.
+    if msg.contains("external api wire error") {
+        return false;
+    }
     // IMPORTANT: do NOT use a bare `"websocket error"` needle here. That
     // phrase is emitted for both genuine transport failures AND for
     // per-request timeouts (`"Websocket error: Timeout"`), and the latter
@@ -53,6 +59,13 @@ pub fn is_connection_error(err: &anyhow::Error) -> bool {
         // state is unknown. Rebuild rather than retry on a socket we can't trust.
         // (Matched lowercased; the rendered text is the CamelCase variant name.)
         "responderdropped",
+        // A lair keystore that went away. The signer holds its own lair
+        // connection, which never reopens, and a call fails at signing as
+        // `Unable to sign zome call: {"error":"BrokenPipe"}`: the io kind,
+        // CamelCase, in lair's error JSON. A send finds the socket closed, and
+        // a request already sent is aborted when the receive loop ends.
+        "brokenpipe",
+        "connectionaborted",
     ];
     NEEDLES.iter().any(|n| msg.contains(n))
 }
@@ -283,10 +296,10 @@ mod tests {
     /// The tests above feed hand-written strings, so they pin only the
     /// classifier. These build the *real* upstream error values and assert the
     /// exact text they render, so a `holochain_client` / `holochain_websocket`
-    /// / `holochain_conductor_api` bump that edits an `#[error(...)]` attribute
-    /// — or the `ExternalApiWireError` `Debug` derivation — fails here instead
-    /// of silently misrouting reconnects (or backpressure cooldowns) in
-    /// production.
+    /// / `holochain_conductor_api` / `lair_keystore_api` bump that edits an
+    /// error's rendering — or the `ExternalApiWireError` `Debug` derivation —
+    /// fails here instead of silently misrouting reconnects (or backpressure
+    /// cooldowns) in production.
     ///
     /// Coverage: all three classifiers now have at least one case built from a
     /// real upstream value, and the three transport errors a caller can receive
@@ -302,7 +315,9 @@ mod tests {
     /// `ExternalApiWireError` case rides on that enum's *auto-derived* `Debug`
     /// (`ConductorApiError` renders it with `{0:?}`), which can shift with no
     /// `#[error(...)]` edit to review and no semver signal — the exact-string
-    /// assertion in `source_chain_pressure_wire_error_*` is the only guard.
+    /// assertion in `source_chain_pressure_wire_error_*` is the only guard; and
+    /// the `SignZomeCallError` that `AppWebsocket::call_zome` wraps a signer's
+    /// failure in is built here by hand, as driving it needs a conductor.
     mod upstream_error_text {
         use super::{is_connection_error, is_request_timeout, is_source_chain_pressure};
         use holochain_client::ConductorApiError;
@@ -567,6 +582,111 @@ mod tests {
             // socket is healthy; the conductor is under pressure.
             assert!(!is_connection_error(&e), "got {e:#}");
             assert!(!is_request_timeout(&e), "got {e:#}");
+        }
+
+        #[test]
+        fn a_conductor_answer_naming_a_transport_failure_is_not_a_connection_failure() {
+            for (wire, expected) in [
+                // The conductor's own lair connection failing under a host fn.
+                (
+                    ExternalApiWireError::RibosomeError(
+                        r#"KeystoreError: {"error":"BrokenPipe"}"#.to_string(),
+                    ),
+                    r#"External API wire error: RibosomeError("KeystoreError: {\"error\":\"BrokenPipe\"}")"#,
+                ),
+                (
+                    ExternalApiWireError::RibosomeError(
+                        r#"KeystoreError: {"error":"ConnectionAborted"}"#.to_string(),
+                    ),
+                    r#"External API wire error: RibosomeError("KeystoreError: {\"error\":\"ConnectionAborted\"}")"#,
+                ),
+                (
+                    ExternalApiWireError::InternalError(
+                        "IO error: connection reset by peer".to_string(),
+                    ),
+                    r#"External API wire error: InternalError("IO error: connection reset by peer")"#,
+                ),
+            ] {
+                let e = rendering(ConductorApiError::ExternalApiWireError(wire), expected);
+                assert!(!is_connection_error(&e), "got {e:#}");
+            }
+        }
+
+        mod lair {
+            use super::{is_connection_error, is_request_timeout, rendering};
+            use crate::lair_fixture::Lair;
+            use holochain_client::ConductorApiError;
+            use lair_keystore_api::dependencies::one_err::OneErr;
+            use lair_keystore_api::prelude::Ed25519PubKey;
+
+            /// `AppWebsocket::call_zome` renders a signer's failure this way.
+            #[track_caller]
+            fn signing_failure(signer: anyhow::Error, expected: &str) -> anyhow::Error {
+                rendering(
+                    ConductorApiError::SignZomeCallError(signer.to_string()),
+                    &format!("Unable to sign zome call: {expected}"),
+                )
+            }
+
+            #[tokio::test]
+            async fn a_sign_after_lair_went_away_is_a_connection_failure() {
+                let mut lair = Lair::start().await;
+                lair.sign(lair.key.clone()).await.unwrap();
+                lair.cut().await;
+
+                let e = signing_failure(
+                    lair.sign(lair.key.clone()).await.unwrap_err(),
+                    r#"{"error":"BrokenPipe"}"#,
+                );
+                assert!(is_connection_error(&e), "got {e:#}");
+            }
+
+            #[tokio::test]
+            async fn a_sign_in_flight_when_lair_went_away_is_a_connection_failure() {
+                let mut lair = Lair::start().await;
+                lair.stall_requests.notify_one();
+                let mut in_flight = tokio::spawn(lair.sign(lair.key.clone()));
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(200), &mut in_flight)
+                        .await
+                        .is_err(),
+                    "the stalled sign must still be waiting on lair"
+                );
+                lair.cut().await;
+
+                let e = signing_failure(
+                    in_flight.await.unwrap().unwrap_err(),
+                    r#"{"error":"ConnectionAborted"}"#,
+                );
+                assert!(is_connection_error(&e), "got {e:#}");
+            }
+
+            #[tokio::test]
+            async fn lair_refusing_a_sign_on_a_live_connection_is_not_a_connection_failure() {
+                let lair = Lair::start().await;
+
+                let e = signing_failure(
+                    lair.sign(Ed25519PubKey::from([7; 32])).await.unwrap_err(),
+                    r#"{"error":"pub key not found"}"#,
+                );
+                assert!(!is_connection_error(&e), "got {e:#}");
+                lair.sign(lair.key.clone())
+                    .await
+                    .expect("the connection is still good");
+            }
+
+            #[test]
+            fn lair_answering_too_slowly_is_not_a_connection_failure() {
+                // What lair's client returns when a request outlives its 30s
+                // wait, handed up as the signer's `?` hands it: a slow keystore
+                // is not a gone one.
+                let e = signing_failure(
+                    anyhow::Error::from(OneErr::from(std::io::ErrorKind::TimedOut)),
+                    r#"{"error":"TimedOut"}"#,
+                );
+                assert!(!is_connection_error(&e), "got {e:#}");
+                assert!(!is_request_timeout(&e), "got {e:#}");
+            }
         }
     }
 }

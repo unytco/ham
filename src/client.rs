@@ -11,6 +11,7 @@ use holochain_client::{
 use lair_keystore_api::dependencies::sodoken::LockedArray;
 use lair_keystore_api::dependencies::url::Url;
 use lair_keystore_api::ipc_keystore_connect;
+use lair_keystore_api::prelude::LairClient;
 use lair_keystore_api::types::SharedLockedArray;
 use serde::de::DeserializeOwned;
 use std::net::Ipv4Addr;
@@ -441,9 +442,40 @@ impl SigningPolicy {
 pub struct Ham {
     app_connection: AppWebsocket,
     cell_id: CellId,
-    // Held to keep the signer — and, on the lair path, its keystore
-    // connection — alive for the lifetime of the websocket.
+    // Held to keep the signer alive for the lifetime of the websocket.
     _signer: DynAgentSigner,
+    _lair: Option<LairConnection>,
+}
+
+/// Shuts its lair connection down when dropped. lair's client has no `Drop` of
+/// its own: its receive task keeps the socket open until lair closes it, and
+/// lair never does, so each dropped `Ham` would leave one open in both
+/// processes.
+struct LairConnection {
+    client: Arc<LairClient>,
+    /// The runtime the client's receive task runs on, which the `Ham` holding
+    /// this may be dropped outside of.
+    runtime: tokio::runtime::Handle,
+}
+
+impl LairConnection {
+    fn new(client: Arc<LairClient>) -> Self {
+        Self {
+            client,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl Drop for LairConnection {
+    fn drop(&mut self) {
+        // A runtime that has shut down drops this task unrun, and has already
+        // closed the socket along with the receive task it owned.
+        let shutdown = self.client.shutdown();
+        self.runtime.spawn(async move {
+            let _ = shutdown.await;
+        });
+    }
 }
 
 impl Ham {
@@ -536,15 +568,20 @@ impl Ham {
             Client(ClientAgentSigner),
         }
 
-        let (signer, pending): (DynAgentSigner, Pending) = match &signing.0 {
-            Decision::Lair(lair) => {
-                // The cell lookup (admin) and the lair connection are
-                // independent; run them concurrently — both feed
-                // `add_credentials` afterwards.
-                let (cell_id, lair_client) =
-                    tokio::try_join!(cell_id_via_admin(&admin, &cfg.app_id), async {
-                        ipc_keystore_connect(lair.connection_url.clone(), lair.passphrase.clone())
+        let (signer, pending, lair_connection): (DynAgentSigner, Pending, Option<LairConnection>) =
+            match &signing.0 {
+                Decision::Lair(lair) => {
+                    // The cell lookup (admin) and the lair connection are
+                    // independent; run them concurrently — both feed
+                    // `add_credentials` afterwards.
+                    let (cell_id, lair_client) =
+                        tokio::try_join!(cell_id_via_admin(&admin, &cfg.app_id), async {
+                            ipc_keystore_connect(
+                                lair.connection_url.clone(),
+                                lair.passphrase.clone(),
+                            )
                             .await
+                            .map(|client| LairConnection::new(Arc::new(client)))
                             .map_err(|e| {
                                 anyhow::anyhow!(
                                     "Failed to connect to lair keystore at {}: {}",
@@ -552,21 +589,21 @@ impl Ham {
                                     e
                                 )
                             })
-                    },)?;
-                // Key the signer on the app's primary (first) provisioned cell
-                // — the same cell the client path authorizes, and the one every
-                // current (single-role) consumer calls. A multi-role app
-                // signing a non-primary role would need per-cell registration
-                // here.
-                let mut signer = LairAgentSigner::new(Arc::new(lair_client));
-                signer.add_credentials(cell_id.clone(), cell_id.agent_pubkey().clone());
-                (Arc::new(signer), Pending::Lair(cell_id))
-            }
-            Decision::CapGrant => {
-                let signer = ClientAgentSigner::default();
-                (signer.clone().into(), Pending::Client(signer))
-            }
-        };
+                        },)?;
+                    // Key the signer on the app's primary (first) provisioned cell
+                    // — the same cell the client path authorizes, and the one every
+                    // current (single-role) consumer calls. A multi-role app
+                    // signing a non-primary role would need per-cell registration
+                    // here.
+                    let mut signer = LairAgentSigner::new(lair_client.client.clone());
+                    signer.add_credentials(cell_id.clone(), cell_id.agent_pubkey().clone());
+                    (Arc::new(signer), Pending::Lair(cell_id), Some(lair_client))
+                }
+                Decision::CapGrant => {
+                    let signer = ClientAgentSigner::default();
+                    (signer.clone().into(), Pending::Client(signer), None)
+                }
+            };
 
         let app_connection = AppWebsocket::connect_with_config(
             (Ipv4Addr::LOCALHOST, port),
@@ -608,6 +645,7 @@ impl Ham {
             app_connection,
             cell_id,
             _signer: signer,
+            _lair: lair_connection,
         })
     }
 
@@ -852,12 +890,79 @@ fn strip_passphrase(mut bytes: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_keystore, strip_passphrase, CapGrantOptIn, Ham, HamConfig, LairCredentials,
-        NodeKeystore, SigningPolicy,
+        parse_keystore, strip_passphrase, CapGrantOptIn, Ham, HamConfig, LairConnection,
+        LairCredentials, NodeKeystore, SigningPolicy,
     };
+    use crate::lair_fixture::Lair;
     use std::time::Duration;
 
     const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
+
+    #[tokio::test]
+    async fn a_dropped_lair_connection_is_closed_on_lairs_side_too() {
+        let lair = Lair::start().await;
+        drop(LairConnection::new(lair.client.clone()));
+
+        tokio::time::timeout(Duration::from_secs(5), lair.closed_by_lair.notified())
+            .await
+            .expect("lair closes the connection once its client shuts its side");
+    }
+
+    /// A lair connection opened on its own runtime, handed back out of it.
+    fn connected_on(runtime: &tokio::runtime::Runtime) -> (Lair, LairConnection) {
+        runtime.block_on(async {
+            let lair = Lair::start().await;
+            let connection = LairConnection::new(lair.client.clone());
+            (lair, connection)
+        })
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_lair_connection_dropped_outside_its_runtime_is_closed_on_lairs_side_too() {
+        let runtime = current_thread_runtime();
+        let (lair, connection) = connected_on(&runtime);
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(connection);
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), lair.closed_by_lair.notified())
+                .await
+                .expect("the runtime that is still alive shuts the client's side down");
+        });
+    }
+
+    #[test]
+    fn a_lair_connection_dropped_after_its_runtime_shut_down_is_quiet() {
+        let runtime = current_thread_runtime();
+        let (lair, connection) = connected_on(&runtime);
+
+        drop(runtime);
+        drop(connection);
+        drop(lair);
+    }
+
+    #[tokio::test]
+    async fn a_lair_client_dropped_on_its_own_stays_connected() {
+        // The upstream fact the guard exists for. When this fails, lair's
+        // client closes its own connection and the guard can go.
+        let lair = Lair::start().await;
+        drop(lair.client);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), lair.closed_by_lair.notified())
+                .await
+                .is_err(),
+            "lair closed a connection whose client was only dropped"
+        );
+    }
 
     fn cfg() -> HamConfig {
         HamConfig::new(8800, 30000, "unyt")
