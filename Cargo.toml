@@ -1,6 +1,6 @@
 [package]
 name = "ham"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Production-grade Holochain AppWebsocket wrapper with reconnect, shutdown, and error-classification helpers"
 license = "MIT OR Apache-2.0"
@@ -11,22 +11,21 @@ categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 anyhow = "1"
-holochain_client = "=0.9.0"
+holochain_client = "=0.9.1"
 lair_keystore_api = "0.7.1"
 rmp-serde = "1.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "signal", "sync", "time", "rt"] }
 tracing = "0.1"
 # Must resolve to the version holochain_client uses, or Cargo builds two copies
-# of its types and ham stops compiling. A caret on purpose: a patch within 0.7
-# can only widen what ham accepts.
-holochain_conductor_api = "0.7.0"
+# of its types and ham stops compiling.
+holochain_conductor_api = "0.7.1"
 
 [dev-dependencies]
 # The first three must match the versions holochain_client resolves, for the
 # same reason as holochain_conductor_api.
-holochain_websocket = "0.7.0"
+holochain_websocket = "0.7.1"
 tungstenite = "0.27"
-holo_hash = "0.7"
+holo_hash = "0.7.1"
 tempfile = "3"
 tokio = { version = "1", features = ["net", "io-util"] }
